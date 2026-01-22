@@ -12,7 +12,48 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""A refactored and simplified ViT adoptation for Pi, taken from big_vision."""
+# Copyright 2024 Big Vision Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""为OpenPI重构和简化的ViT适配版本，基于big_vision实现。
+
+SigLIP (Sigmoid Loss for Language Image Pre-training) 是一种用于视觉-语言预训练的模型架构，
+在OpenPI中用作视觉编码器组件。主要特点：
+
+1. 基于Vision Transformer (ViT) 架构
+2. 使用sigmoid损失而非对比损失进行训练
+3. 专门适配机器人视觉任务的需求
+4. 支持多种位置编码方式（学习型、正弦余弦2D）
+
+核心功能：
+- 图像patch编码
+- 多头自注意力机制
+- 位置编码（正弦余弦或可学习）
+- 分层特征提取
+- 与PaliGemma集成的视觉-语言表示
+
+用于OpenPI框架：
+- 作为PI0模型的视觉组件
+- 处理机器人摄像头输入
+- 生成与动作预测相关的视觉特征
+- 支持多摄像头融合
+
+本实现针对机器人任务进行了优化，包括：
+- 适合机器人视觉的patch大小
+- 高效的注意力计算
+- 与JAX/Flax框架的深度集成
+"""
 
 from collections.abc import Sequence
 
@@ -25,10 +66,34 @@ import openpi.training.sharding as sharding
 
 
 def posemb_sincos_2d(h, w, width, temperature=10_000.0, dtype=jnp.float32):
-    """Follows the MoCo v3 logic."""
+    """生成2D正弦余弦位置编码。
+    
+    遵循MoCo v3的逻辑实现2D位置编码。这种编码方式能够：
+    - 为图像的每个位置生成唯一的位置编码
+    - 保持空间关系的连续性
+    - 支持不同分辨率的图像
+    
+    位置编码的构造：
+    1. 为每个像素位置(x,y)生成坐标网格
+    2. 使用不同频率的正弦和余弦函数编码x和y坐标
+    3. 将x和y的编码拼接成最终的位置向量
+    
+    Args:
+        h: 图像高度（patch数量）
+        w: 图像宽度（patch数量）
+        width: 位置编码的维度，必须是4的倍数
+        temperature: 温度参数，控制编码频率的范围
+        dtype: 输出数据类型
+        
+    Returns:
+        形状为[1, h*w, width]的位置编码张量
+        
+    注意：
+        width必须是4的倍数，因为需要分别为x和y坐标的sin/cos编码
+    """
     y, x = jnp.mgrid[:h, :w]
 
-    assert width % 4 == 0, "Width must be mult of 4 for sincos posemb"
+    assert width % 4 == 0, "宽度必须是4的倍数，以支持sincos位置编码"
     omega = jnp.arange(width // 4) / (width // 4 - 1)
     omega = 1.0 / (temperature**omega)
     y = jnp.einsum("m,d->md", y.flatten(), omega)
@@ -38,6 +103,26 @@ def posemb_sincos_2d(h, w, width, temperature=10_000.0, dtype=jnp.float32):
 
 
 def get_posemb(self, typ, seqshape, width, name, dtype=jnp.float32):
+    """获取位置编码参数。
+    
+    根据指定的类型创建不同的位置编码：
+    - 'learn': 可学习的位置编码参数
+    - 'sincos2d': 2D正弦余弦位置编码
+    
+    Args:
+        self: 神经网络模块实例
+        typ: 位置编码类型（'learn'或'sincos2d'）
+        seqshape: 序列形状，对于图像是(height, width)
+        width: 编码维度
+        name: 参数名称
+        dtype: 数据类型
+        
+    Returns:
+        位置编码张量
+        
+    Raises:
+        ValueError: 如果位置编码类型不支持
+    """
     if typ == "learn":
         return self.param(
             name,

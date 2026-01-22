@@ -12,7 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PyTorch Siglip model."""
+"""PyTorch SigLIP 模型实现。
+
+SigLIP (Sigmoid Loss for Language Image Pre-training) 是一种用于视觉-语言预训练的模型。
+主要特点：
+- 使用 sigmoid 损失而非对比损失
+- 更高效的图像-文本匹配
+- 支持灵活的批次大小
+- 可用于图像分类、图像-文本检索等任务
+
+在 OpenPI 项目中，SigLIP 作为视觉编码器，用于处理机器人的多摄像头输入。
+"""
 
 import math
 import warnings
@@ -39,10 +49,14 @@ logger = logging.get_logger(__name__)
 
 
 def _trunc_normal_(tensor, mean, std, a, b):
-    # Cut & paste from PyTorch official master until it's in a few official releases - RW
-    # Method based on https://people.sc.fsu.edu/~jburkardt/presentations/truncated_normal.pdf
+    """截断正态分布初始化（内部实现）。
+    
+    使用截断正态分布填充张量，确保值在 [a, b] 范围内。
+    这是从 PyTorch 官方版本复制的实现。
+    方法基于：https://people.sc.fsu.edu/~jburkardt/presentations/truncated_normal.pdf
+    """
     def norm_cdf(x):
-        # Computes standard normal cumulative distribution function
+        """计算标准正态分布的累积分布函数（CDF）。"""
         return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
 
     if (mean < a - 2 * std) or (mean > b + 2 * std):
@@ -101,6 +115,21 @@ def trunc_normal_tf_(
 
 
 def variance_scaling_(tensor, scale=1.0, mode="fan_in", distribution="normal"):
+    """方差缩放初始化。
+    
+    根据网络层的输入/输出维度自动调整初始化方差，
+    这有助于保持激活值和梯度在合理范围内。
+    
+    Args:
+        tensor: 要初始化的张量
+        scale: 缩放因子
+        mode: 计算方差的模式
+            - 'fan_in': 基于输入维度
+            - 'fan_out': 基于输出维度  
+            - 'fan_avg': 基于输入输出维度的平均值
+        distribution: 分布类型 ('truncated_normal', 'normal', 'uniform')
+    """
+    # 计算扇入（输入连接数）和扇出（输出连接数）
     fan_in, fan_out = _calculate_fan_in_and_fan_out(tensor)
     if mode == "fan_in":
         denom = fan_in
@@ -210,19 +239,32 @@ class SiglipOutput(ModelOutput):
 
 
 class SiglipVisionEmbeddings(nn.Module):
+    """SigLIP 视觉嵌入层。
+    
+    将输入图像转换为 patch embeddings（图像块嵌入）并添加位置编码。
+    
+    工作流程：
+    1. 使用卷积层将图像分割成固定大小的 patches
+    2. 每个 patch 被映射到 embed_dim 维度的向量
+    3. 添加可学习的位置编码以保留空间信息
+    
+    例如：224x224 图像 + 14x14 patch size → 16x16=256 个 patches
+    """
     def __init__(self, config: SiglipVisionConfig):
         super().__init__()
         self.config = config
-        self.embed_dim = config.hidden_size
-        self.image_size = config.image_size
-        self.patch_size = config.patch_size
+        self.embed_dim = config.hidden_size  # 嵌入维度（如 768）
+        self.image_size = config.image_size  # 图像尺寸（如 224）
+        self.patch_size = config.patch_size  # patch 大小（如 14）
 
+        # 使用卷积层实现 patch embedding
+        # kernel_size=patch_size, stride=patch_size 确保不重叠的 patches
         self.patch_embedding = nn.Conv2d(
-            in_channels=config.num_channels,
+            in_channels=config.num_channels,  # 通常为 3 (RGB)
             out_channels=self.embed_dim,
             kernel_size=self.patch_size,
             stride=self.patch_size,
-            padding="valid",
+            padding="valid",  # 不添加填充
         )
 
         self.num_patches = (self.image_size // self.patch_size) ** 2
@@ -231,13 +273,29 @@ class SiglipVisionEmbeddings(nn.Module):
         self.register_buffer("position_ids", torch.arange(self.num_positions).expand((1, -1)), persistent=False)
 
     def interpolate_pos_encoding(self, embeddings: torch.Tensor, height: int, width: int) -> torch.Tensor:
-        """
-        This method allows to interpolate the pre-trained position encodings, to be able to use the model on higher resolution
-        images. This method is also adapted to support torch.jit tracing and no class embeddings.
-
-        Adapted from:
-        - https://github.com/facebookresearch/dino/blob/de9ee3df6cf39fac952ab558447af1fa1365362a/vision_transformer.py#L174-L194, and
-        - https://github.com/facebookresearch/dinov2/blob/e1277af2ba9496fbadf7aec6eba56e8d882d1e35/dinov2/models/vision_transformer.py#L179-L211
+        """插值位置编码以支持不同分辨率的图像。
+        
+        该方法允许在更高分辨率的图像上使用预训练的位置编码。
+        通过双三次插值调整位置编码的空间维度。
+        
+        这对于以下场景很有用：
+        - 在不同分辨率的图像上进行迁移学习
+        - 处理可变大小的输入图像
+        - 保持预训练权重的同时增加输入分辨率
+        
+        该方法也适配了 torch.jit tracing，并且不使用类别嵌入。
+        
+        改编自：
+        - DINO: https://github.com/facebookresearch/dino
+        - DINOv2: https://github.com/facebookresearch/dinov2
+        
+        Args:
+            embeddings: 输入嵌入 [batch, num_patches, dim]
+            height: 输入图像高度
+            width: 输入图像宽度
+            
+        Returns:
+            插值后的位置编码 [1, new_num_patches, dim]
         """
 
         num_patches = embeddings.shape[1]
@@ -283,11 +341,23 @@ class SiglipVisionEmbeddings(nn.Module):
 
 # Copied from transformers.models.clip.modeling_clip.CLIPTextEmbeddings with CLIP->Siglip
 class SiglipTextEmbeddings(nn.Module):
+    """SigLIP 文本嵌入层。
+    
+    将文本 token IDs 转换为嵌入向量，并添加位置编码。
+    
+    组成部分：
+    1. Token Embedding: 将词汇表中的 token ID 映射到向量空间
+    2. Position Embedding: 为每个位置学习一个嵌入，编码序列中的位置信息
+    
+    最终输出 = token_embedding + position_embedding
+    """
     def __init__(self, config: SiglipTextConfig):
         super().__init__()
         embed_dim = config.hidden_size
 
+        # Token 嵌入：vocab_size -> embed_dim
         self.token_embedding = nn.Embedding(config.vocab_size, embed_dim)
+        # 位置嵌入：max_seq_len -> embed_dim
         self.position_embedding = nn.Embedding(config.max_position_embeddings, embed_dim)
 
         # position_ids (1, len position emb) is contiguous in memory and exported when serialized
@@ -332,36 +402,76 @@ def eager_attention_forward(
     dropout: float = 0.0,
     **kwargs,
 ):
+    """标准的注意力前向传播实现（eager 模式）。
+    
+    实现标准的缩放点积注意力机制：
+    Attention(Q, K, V) = softmax(Q * K^T / sqrt(d_k)) * V
+    
+    Args:
+        module: 注意力模块
+        query: 查询张量 [batch, num_heads, seq_len, head_dim]
+        key: 键张量 [batch, num_heads, seq_len, head_dim]
+        value: 值张量 [batch, num_heads, seq_len, head_dim]
+        attention_mask: 注意力掩码，用于屏蔽某些位置
+        scaling: 缩放因子，通常为 1/sqrt(head_dim)
+        dropout: dropout 概率
+        
+    Returns:
+        attn_output: 注意力输出 [batch, seq_len, num_heads * head_dim]
+        attn_weights: 注意力权重 [batch, num_heads, seq_len, seq_len]
+    """
+    # 1. 计算注意力分数：Q @ K^T，然后缩放
     attn_weights = torch.matmul(query, key.transpose(-1, -2)) * scaling
+    
+    # 2. 应用注意力掩码（如果提供）
     if attention_mask is not None:
         attn_weights = attn_weights + attention_mask
 
+    # 3. Softmax 归一化（使用 float32 保证数值稳定性）
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    
+    # 4. 应用 dropout
     attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
 
+    # 5. 加权求和：attention_weights @ V
     attn_output = torch.matmul(attn_weights, value)
+    # 6. 重新排列维度：[batch, num_heads, seq_len, head_dim] -> [batch, seq_len, num_heads * head_dim]
     attn_output = attn_output.transpose(1, 2).contiguous()
 
     return attn_output, attn_weights
 
 
 class SiglipAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
+    """多头注意力机制（来自 'Attention Is All You Need' 论文）。
+    
+    实现标准的多头自注意力，将输入投影到多个子空间，
+    在每个子空间中独立计算注意力，然后合并结果。
+    
+    多头注意力的优势：
+    - 允许模型同时关注不同位置的不同表示子空间
+    - 增强模型的表达能力
+    - 每个头可以学习不同类型的关系
+    
+    在 SigLIP 中用于视觉和文本编码器的所有层。
+    """
 
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.embed_dim = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.embed_dim // self.num_heads
+        self.embed_dim = config.hidden_size  # 总嵌入维度
+        self.num_heads = config.num_attention_heads  # 注意力头数
+        self.head_dim = self.embed_dim // self.num_heads  # 每个头的维度
+        
+        # 确保嵌入维度可以被头数整除
         if self.head_dim * self.num_heads != self.embed_dim:
             raise ValueError(
                 f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim} and `num_heads`:"
                 f" {self.num_heads})."
             )
-        self.scale = self.head_dim**-0.5
+        
+        self.scale = self.head_dim**-0.5  # 缩放因子 1/sqrt(head_dim)
         self.dropout = config.attention_dropout
-        self.is_causal = False
+        self.is_causal = False  # SigLIP 不使用因果掩码
 
         self.k_proj = nn.Linear(self.embed_dim, self.embed_dim)
         self.v_proj = nn.Linear(self.embed_dim, self.embed_dim)
@@ -418,11 +528,25 @@ class SiglipAttention(nn.Module):
 
 # Copied from transformers.models.clip.modeling_clip.CLIPMLP with CLIP->Siglip
 class SiglipMLP(nn.Module):
+    """SigLIP 的前馈神经网络（MLP）模块。
+    
+    实现标准的两层全连接网络，用于 Transformer 块中的前馈部分：
+    FFN(x) = activation(x @ W1 + b1) @ W2 + b2
+    
+    通常配置为：
+    - fc1: hidden_size -> intermediate_size (例如 768 -> 3072，4倍扩展)
+    - activation: GELU 或其他激活函数
+    - fc2: intermediate_size -> hidden_size (例如 3072 -> 768，投影回原始维度)
+    
+    这种先扩展后压缩的结构增加了模型的表达能力。
+    """
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.activation_fn = ACT2FN[config.hidden_act]
+        self.activation_fn = ACT2FN[config.hidden_act]  # 激活函数（如 GELU）
+        # 第一层：扩展维度
         self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
+        # 第二层：压缩回原始维度
         self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -433,12 +557,28 @@ class SiglipMLP(nn.Module):
 
 
 class SiglipEncoderLayer(GradientCheckpointingLayer):
+    """SigLIP Transformer 编码器层。
+    
+    标准的 Transformer 编码器块，包含：
+    1. 多头自注意力子层（带残差连接和层归一化）
+    2. 前馈网络子层（带残差连接和层归一化）
+    
+    使用 Pre-LN 结构（先归一化再应用子层）：
+    - x = x + SelfAttention(LayerNorm(x))
+    - x = x + MLP(LayerNorm(x))
+    
+    Pre-LN 相比 Post-LN 更稳定，训练更容易。
+    """
     def __init__(self, config: Union[SiglipVisionConfig, SiglipTextConfig]):
         super().__init__()
         self.embed_dim = config.hidden_size
+        # 第一个层归一化（用于自注意力前）
         self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
+        # 多头自注意力模块
         self.self_attn = SiglipAttention(config)
+        # 第二个层归一化（用于 MLP 前）
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
+        # 前馈网络模块
         self.mlp = SiglipMLP(config)
 
     def forward(
@@ -627,6 +767,17 @@ class SiglipEncoder(nn.Module):
 
 
 class SiglipTextTransformer(nn.Module):
+    """SigLIP 文本 Transformer 模型。
+    
+    完整的文本编码器，包括：
+    1. 文本嵌入层（token + position embeddings）
+    2. 多层 Transformer 编码器
+    3. 最终的层归一化
+    4. 投影头（将编码器输出投影到共享的多模态空间）
+    
+    与视觉编码器不同，文本编码器使用最后一个 token（EOS token）的表示
+    作为整个句子的表示（类似 BERT 的 [CLS] token）。
+    """
     def __init__(self, config: SiglipTextConfig):
         super().__init__()
         self.config = config
@@ -635,6 +786,7 @@ class SiglipTextTransformer(nn.Module):
         self.encoder = SiglipEncoder(config)
         self.final_layer_norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
 
+        # 投影头：将文本表示投影到多模态空间
         self.head = nn.Linear(embed_dim, config.projection_size)
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
 
@@ -675,11 +827,14 @@ class SiglipTextTransformer(nn.Module):
         )
 
         last_hidden_state = encoder_outputs.last_hidden_state
+        # 最后的层归一化
         last_hidden_state = self.final_layer_norm(last_hidden_state)
 
-        # Assuming "sticky" EOS tokenization, last token is always EOS.
-        pooled_output = last_hidden_state[:, -1, :]
-        pooled_output = self.head(pooled_output)
+        # 假设使用 "sticky" EOS tokenization，最后一个 token 总是 EOS
+        # 取最后一个 token 的表示作为整个句子的表示（池化输出）
+        pooled_output = last_hidden_state[:, -1, :]  # [batch, hidden_size]
+        # 通过投影头映射到多模态空间
+        pooled_output = self.head(pooled_output)  # [batch, projection_size]
 
         return BaseModelOutputWithPooling(
             last_hidden_state=last_hidden_state,
@@ -746,16 +901,31 @@ class SiglipTextModel(SiglipPreTrainedModel):
 
 
 class SiglipVisionTransformer(nn.Module):
+    """SigLIP 视觉 Transformer 主干网络。
+    
+    完整的视觉编码器，用于将图像转换为高维特征表示：
+    1. 图像 -> Patch Embeddings（通过 SiglipVisionEmbeddings）
+    2. Patch Embeddings -> Transformer 编码（通过 SiglipEncoder）
+    3. 编码后的特征 -> 层归一化
+    4. [可选] 多头注意力池化 -> 全局图像表示
+    
+    在 OpenPI 中，这是处理机器人摄像头图像的核心组件。
+    """
     def __init__(self, config: SiglipVisionConfig):
         super().__init__()
         self.config = config
         embed_dim = config.hidden_size
 
+        # 图像到 patch embeddings 的转换层
         self.embeddings = SiglipVisionEmbeddings(config)
+        # Transformer 编码器（多层 SiglipEncoderLayer）
         self.encoder = SiglipEncoder(config)
+        # 最后的层归一化
         self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
+        # 是否使用注意力池化头（用于生成全局图像特征）
         self.use_head = True if not hasattr(config, "vision_use_head") else config.vision_use_head
         if self.use_head:
+            # 多头注意力池化：将所有 patch tokens 池化为单个向量
             self.head = SiglipMultiheadAttentionPoolingHead(config)
 
     @can_return_tuple
@@ -777,15 +947,22 @@ class SiglipVisionTransformer(nn.Module):
         if len(self.encoder.layers) > 0 and self.encoder.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
             hidden_states = hidden_states.to(torch.bfloat16)
 
+        # 通过 Transformer 编码器处理嵌入
+        # 输入：[batch, num_patches, hidden_size]
+        # 输出：[batch, num_patches, hidden_size]
         encoder_outputs: BaseModelOutput = self.encoder(
             inputs_embeds=hidden_states,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
         )
 
+        # 获取编码器的最后隐藏状态
         last_hidden_state = encoder_outputs.last_hidden_state
+        # 应用后层归一化
         last_hidden_state = self.post_layernorm(last_hidden_state)
 
+        # 如果使用池化头，通过注意力机制聚合所有 patches
+        # pooler_output: [batch, projection_size]
         pooler_output = self.head(last_hidden_state) if self.use_head else None
 
         return BaseModelOutputWithPooling(
@@ -797,27 +974,56 @@ class SiglipVisionTransformer(nn.Module):
 
 
 class SiglipMultiheadAttentionPoolingHead(nn.Module):
-    """Multihead Attention Pooling."""
+    """多头注意力池化头。
+    
+    使用可学习的查询向量（probe）通过注意力机制从所有 patch tokens 中
+    聚合信息，生成单个全局图像表示。
+    
+    工作原理：
+    1. probe 作为查询（Q），patch tokens 作为键（K）和值（V）
+    2. 计算注意力：attention(probe, patches, patches)
+    3. 得到加权聚合的全局特征
+    4. 通过 MLP 进一步处理
+    
+    这比简单的平均池化更灵活，因为模型可以学习关注重要的 patches。
+    """
 
     def __init__(self, config: SiglipVisionConfig):
         super().__init__()
 
+        # 可学习的查询向量，用于从 patch tokens 中提取信息
         self.probe = nn.Parameter(torch.randn(1, 1, config.hidden_size))
+        # 多头注意力模块
         self.attention = torch.nn.MultiheadAttention(config.hidden_size, config.num_attention_heads, batch_first=True)
+        # 层归一化
         self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        # MLP 用于进一步处理聚合后的特征
         self.mlp = SiglipMLP(config)
 
     def forward(self, hidden_state):
+        """通过注意力机制聚合 patch tokens。
+        
+        Args:
+            hidden_state: 所有 patch 的表示 [batch, num_patches, embed_dim]
+            
+        Returns:
+            聚合后的全局图像表示 [batch, embed_dim]
+        """
         batch_size = hidden_state.shape[0]
-        probe = self.probe.repeat(batch_size, 1, 1)
+        # 复制 probe 到 batch 中的每个样本
+        probe = self.probe.repeat(batch_size, 1, 1)  # [batch, 1, embed_dim]
 
+        # 注意力计算：probe 作为查询，hidden_state 作为键和值
+        # 输出: [batch, 1, embed_dim] - probe 聚合了所有 patches 的信息
         hidden_state = self.attention(probe, hidden_state, hidden_state)[0]
 
+        # 残差连接 + MLP
         residual = hidden_state
         hidden_state = self.layernorm(hidden_state)
         hidden_state = residual + self.mlp(hidden_state)
 
-        return hidden_state[:, 0]
+        # 返回聚合的单个向量（去掉序列维度）
+        return hidden_state[:, 0]  # [batch, embed_dim]
 
 
 @auto_docstring(
@@ -1058,6 +1264,7 @@ class SiglipModel(SiglipPreTrainedModel):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
+        # 1. 视觉编码：图像 -> 视觉特征
         vision_outputs: BaseModelOutputWithPooling = self.vision_model(
             pixel_values=pixel_values,
             output_attentions=output_attentions,
@@ -1065,6 +1272,7 @@ class SiglipModel(SiglipPreTrainedModel):
             interpolate_pos_encoding=interpolate_pos_encoding,
         )
 
+        # 2. 文本编码：文本 -> 文本特征
         text_outputs: BaseModelOutputWithPooling = self.text_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1073,14 +1281,17 @@ class SiglipModel(SiglipPreTrainedModel):
             output_hidden_states=output_hidden_states,
         )
 
+        # 3. 提取池化后的全局特征
         image_embeds = vision_outputs.pooler_output
         text_embeds = text_outputs.pooler_output
 
-        # normalized features
+        # 4. L2 归一化特征（使其在单位超球面上）
+        # 这对于计算余弦相似度很重要
         image_embeds = image_embeds / image_embeds.norm(p=2, dim=-1, keepdim=True)
         text_embeds = text_embeds / text_embeds.norm(p=2, dim=-1, keepdim=True)
 
-        # cosine similarity as logits
+        # 5. 计算图像-文本相似度（余弦相似度 = 归一化向量的点积）
+        # logits_per_text[i, j] = 文本i与图像j的相似度
         logits_per_text = torch.matmul(text_embeds, image_embeds.t().to(text_embeds.device))
 
         logit_scale, logit_bias = self.logit_scale.to(text_embeds.device), self.logit_bias.to(text_embeds.device)
@@ -1090,11 +1301,22 @@ class SiglipModel(SiglipPreTrainedModel):
 
         loss = None
         if return_loss:
-            # Adapted from https://github.com/google-research/big_vision/blob/01edb81a4716f93a48be43b3a4af14e29cdb3a7f/big_vision/trainers/proj/image_text/siglip.py#L287
+            # 计算 SigLIP 的 sigmoid 损失
+            # 改编自：https://github.com/google-research/big_vision/.../siglip.py#L287
+            # 
+            # SigLIP 使用 sigmoid 损失而非对比损失（CLIP）：
+            # - 对角线元素（匹配对）：logsigmoid(+logit)
+            # - 非对角线元素（不匹配对）：logsigmoid(-logit)
+            # 
+            # 这比对比损失更简单，且不需要大批次
             eye = torch.eye(logits_per_text.size(0), device=logits_per_text.device)
+            # 构造符号矩阵：对角线为 +1，其他为 -1
             m1_diag1 = -torch.ones_like(logits_per_text) + 2 * eye
+            # 计算 log-sigmoid 对数似然
             loglik = torch.nn.functional.logsigmoid(m1_diag1 * logits_per_text)
+            # 负对数似然（每个样本）
             nll = -torch.sum(loglik, dim=-1)
+            # 平均损失
             loss = nll.mean()
 
         return SiglipOutput(
@@ -1181,6 +1403,7 @@ class SiglipForImageClassification(SiglipPreTrainedModel):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
+        # 1. 通过视觉编码器提取特征
         outputs: BaseModelOutputWithPooling = self.vision_model(
             pixel_values,
             output_attentions=output_attentions,
@@ -1188,36 +1411,44 @@ class SiglipForImageClassification(SiglipPreTrainedModel):
             interpolate_pos_encoding=interpolate_pos_encoding,
         )
 
-        sequence_output = outputs.last_hidden_state
+        # 2. 获取所有 patch tokens 的表示
+        sequence_output = outputs.last_hidden_state  # [batch, num_patches, hidden_size]
 
-        # average pool the patch tokens
+        # 3. 全局平均池化：对所有 patches 求平均，得到图像的全局表示
+        # [batch, num_patches, hidden_size] -> [batch, hidden_size]
         sequence_output = torch.mean(sequence_output, dim=1)
-        # apply classifier
+        
+        # 4. 通过分类器头预测类别 logits
+        # [batch, hidden_size] -> [batch, num_labels]
         logits = self.classifier(sequence_output)
 
+        # 5. 计算损失（如果提供了标签）
         loss = None
         if labels is not None:
-            # move labels to correct device to enable model parallelism
+            # 将标签移到正确的设备上（支持模型并行）
             labels = labels.to(logits.device)
+            
+            # 自动检测问题类型
             if self.config.problem_type is None:
                 if self.num_labels == 1:
-                    self.config.problem_type = "regression"
+                    self.config.problem_type = "regression"  # 回归任务
                 elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
-                    self.config.problem_type = "single_label_classification"
+                    self.config.problem_type = "single_label_classification"  # 单标签分类
                 else:
-                    self.config.problem_type = "multi_label_classification"
+                    self.config.problem_type = "multi_label_classification"  # 多标签分类
 
+            # 根据问题类型计算相应的损失
             if self.config.problem_type == "regression":
-                loss_fct = MSELoss()
+                loss_fct = MSELoss()  # 均方误差损失
                 if self.num_labels == 1:
                     loss = loss_fct(logits.squeeze(), labels.squeeze())
                 else:
                     loss = loss_fct(logits, labels)
             elif self.config.problem_type == "single_label_classification":
-                loss_fct = CrossEntropyLoss()
+                loss_fct = CrossEntropyLoss()  # 交叉熵损失
                 loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
             elif self.config.problem_type == "multi_label_classification":
-                loss_fct = BCEWithLogitsLoss()
+                loss_fct = BCEWithLogitsLoss()  # 二元交叉熵损失（带 logits）
                 loss = loss_fct(logits, labels)
 
         return ImageClassifierOutput(

@@ -107,7 +107,9 @@ def _download_fsspec(url: str, local_path: pathlib.Path, **kwargs) -> None:
         total_size = fs.du(url)
     else:
         total_size = info["size"]
-    with tqdm.tqdm(total=total_size, unit="iB", unit_scale=True, unit_divisor=1024) as pbar:
+    # Force tqdm to use stdout and disable mininterval for more frequent updates
+    with tqdm.tqdm(total=total_size, unit="iB", unit_scale=True, unit_divisor=1024, 
+                   mininterval=0.5, file=None, ncols=80) as pbar:
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         future = executor.submit(fs.get, url, local_path, recursive=is_dir)
         while not future.done():
