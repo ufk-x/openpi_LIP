@@ -164,6 +164,264 @@ WebSocket 服务器实现位于 [../../src/openpi/serving/websocket_policy_serve
    outputs = self._output_transform(outputs)
    ```
 
+#### 3.3.1 LIBERO 数据转换流程
+
+数据转换是连接环境观察和模型输入/输出的关键桥梁，定义在 [libero_policy.py](../../src/openpi/policies/libero_policy.py)。
+
+```
+src/openpi/policies/libero_policy.py [LiberoInputs]  
+    |
+    v
+src/openpi/policies/config.py [data_transforms = _transforms.Group] 
+    |
+    v
+src/openpi/policies/policy_config.py [create_trained_policy()的返回值形参transforms]
+    |
+    v 
+src/openpi/policies/policy.py  [_input_transform, _output_transform]
+    |
+    v
+src/openpi/policies/policy.py [Policy.infer()中inputs = self._input_transform(inputs)]
+```
+
+**转换器配置**
+
+在策略初始化时（[policy_config.py#L80-L91](../../src/openpi/policies/policy_config.py#L80-L91)），会组装一系列转换器：
+
+```python
+return _policy.Policy(
+    model,
+    transforms=[
+        *repack_transforms.inputs,
+        transforms.InjectDefaultPrompt(default_prompt),  # 注入默认提示
+        *data_config.data_transforms.inputs,             # ← LiberoInputs 在这里
+        transforms.Normalize(norm_stats, ...),            # 归一化
+        *data_config.model_transforms.inputs,             # 模型特定转换
+    ],
+    output_transforms=[
+        *data_config.model_transforms.outputs,            # 模型特定逆转换
+        transforms.Unnormalize(norm_stats, ...),          # 反归一化
+        *data_config.data_transforms.outputs,             # ← LiberoOutputs 在这里
+        *repack_transforms.outputs,
+    ],
+)
+```
+
+**LiberoInputs：输入数据转换**
+
+定义位置：[libero_policy.py#L69-L170](../../src/openpi/policies/libero_policy.py#L69-L170)
+
+功能：将客户端发送的观察数据转换为模型期望的输入格式。
+
+**转换步骤：**
+
+1. **解析图像格式**（第 125-126 行）：
+   ```python
+   base_image = _parse_image(data["observation/image"])        # 主摄像头
+   wrist_image = _parse_image(data["observation/wrist_image"]) # 腕部摄像头
+   ```
+   - 处理 LeRobot 格式（float32, CHW）→ 标准格式（uint8, HWC）
+   - 如果是浮点数图像：`image = (255 * image).astype(np.uint8)`
+   - 如果是 CHW 格式：转换为 HWC 格式
+
+2. **组织多视角图像**（第 131-136 行）：
+   ```python
+   "image": {
+       "base_0_rgb": base_image,                         # 第三人称固定相机
+       "left_wrist_0_rgb": wrist_image,                  # 左腕部相机
+       "right_wrist_0_rgb": np.zeros_like(base_image),   # 填充（不存在）
+   }
+   ```
+   PI0 模型支持最多 3 个视角，LIBERO 只有 2 个，所以用零数组填充第三个。
+
+3. **添加图像掩码**（第 139-143 行）：
+   ```python
+   "image_mask": {
+       "base_0_rgb": np.True_,           # 有效图像
+       "left_wrist_0_rgb": np.True_,     # 有效图像
+       "right_wrist_0_rgb": np.False_,   # 填充图像（PI0）或 np.True_（PI0-FAST）
+   }
+   ```
+   掩码告诉模型哪些图像是真实的，哪些是填充的。PI0 模型会忽略填充图像，而 PI0-FAST 处理所有图像。
+
+4. **传递机器人状态和提示**（第 130, 153-155 行）：
+   ```python
+   "state": data["observation/state"],  # 8 维：位置(3) + 姿态(3) + 夹爪(2)
+   "prompt": data["prompt"],            # 任务描述，如 "put the bowl on the plate"
+   ```
+
+**输入转换示例：**
+
+```python
+# 客户端发送的原始数据
+input_data = {
+    "observation/image": np.array([224, 224, 3], dtype=uint8),
+    "observation/wrist_image": np.array([224, 224, 3], dtype=uint8),
+    "observation/state": np.array([8], dtype=float32),
+    "prompt": "pick up the black bowl and place it on the plate"
+}
+
+# LiberoInputs 转换后
+model_input = {
+    "state": np.array([8], dtype=float32),
+    "image": {
+        "base_0_rgb": np.array([224, 224, 3], dtype=uint8),
+        "left_wrist_0_rgb": np.array([224, 224, 3], dtype=uint8),
+        "right_wrist_0_rgb": np.zeros([224, 224, 3], dtype=uint8),
+    },
+    "image_mask": {
+        "base_0_rgb": True,
+        "left_wrist_0_rgb": True,
+        "right_wrist_0_rgb": False,
+    },
+    "prompt": "pick up the black bowl and place it on the plate"
+}
+```
+
+**LiberoOutputs：输出数据转换**
+
+定义位置：[libero_policy.py#L173-L210](../../src/openpi/policies/libero_policy.py#L173-L210)
+
+功能：从模型输出中提取 LIBERO 环境所需的动作维度。
+
+**转换逻辑：**
+
+PI0 模型的动作维度可能大于 LIBERO 所需的 7 维（为了支持多种机器人配置）。`LiberoOutputs` 负责提取正确的维度。
+
+```python
+def __call__(self, data: dict) -> dict:
+    # 仅返回前 7 维动作
+    # LIBERO 动作空间：
+    #   - 位置增量 (3): delta_x, delta_y, delta_z
+    #   - 旋转增量 (3): delta_roll, delta_pitch, delta_yaw
+    #   - 夹爪动作 (1): open/close [-1, 1]
+    return {"actions": np.asarray(data["actions"][:, :7])}
+```
+
+**输出转换示例：**
+
+```python
+# 模型输出（可能包含填充维度）
+model_output = {
+    "actions": np.array([[action_horizon, action_dim]], dtype=float32)  # 例如 [15, 14]
+}
+
+# LiberoOutputs 转换后
+env_actions = {
+    "actions": np.array([[15, 7]], dtype=float32)  # 只保留前 7 维
+}
+```
+
+**完整数据流**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 客户端：构造观察数据                                          │
+└─────────────────────────────────────────────────────────────┘
+                            │
+                            ↓
+            {
+              "observation/image": [224, 224, 3],
+              "observation/wrist_image": [224, 224, 3],
+              "observation/state": [8],
+              "prompt": "task description"
+            }
+                            │
+┌───────────────────────────┼───────────────────────────────┐
+│ 服务器：Policy.infer()    ↓                               │
+│                                                            │
+│  ┌──────────────────────────────────────────────┐         │
+│  │ 1. InjectDefaultPrompt                        │         │
+│  │    如果没有 prompt，使用默认值                 │         │
+│  └──────────────────────────────────────────────┘         │
+│                            │                               │
+│  ┌──────────────────────────────────────────────┐         │
+│  │ 2. LiberoInputs.__call__()                    │         │
+│  │    - 解析图像格式 (uint8, HWC)                │         │
+│  │    - 组织多视角图像                           │         │
+│  │    - 添加图像掩码                             │         │
+│  │    - 传递状态和提示                           │         │
+│  └──────────────────────────────────────────────┘         │
+│                            │                               │
+│                            ↓                               │
+│            {                                               │
+│              "state": [8],                                 │
+│              "image": {                                    │
+│                "base_0_rgb": [224,224,3],                  │
+│                "left_wrist_0_rgb": [224,224,3],            │
+│                "right_wrist_0_rgb": [224,224,3] (zeros)    │
+│              },                                            │
+│              "image_mask": {...},                          │
+│              "prompt": "task description"                  │
+│            }                                               │
+│                            │                               │
+│  ┌──────────────────────────────────────────────┐         │
+│  │ 3. Normalize                                  │         │
+│  │    使用预计算的统计信息归一化                  │         │
+│  └──────────────────────────────────────────────┘         │
+│                            │                               │
+│  ┌──────────────────────────────────────────────┐         │
+│  │ 4. ModelTransforms                            │         │
+│  │    - 分词化提示（Gemma tokenizer）            │         │
+│  │    - 填充动作到模型维度                       │         │
+│  └──────────────────────────────────────────────┘         │
+│                            │                               │
+│  ┌──────────────────────────────────────────────┐         │
+│  │ 5. PI0.sample_actions()                       │         │
+│  │    流匹配推理生成动作                          │         │
+│  └──────────────────────────────────────────────┘         │
+│                            │                               │
+│                            ↓                               │
+│            {"actions": [action_horizon, action_dim]}       │
+│                            │                               │
+│  ┌──────────────────────────────────────────────┐         │
+│  │ 6. ModelTransforms (outputs)                  │         │
+│  │    移除模型特定的包装                         │         │
+│  └──────────────────────────────────────────────┘         │
+│                            │                               │
+│  ┌──────────────────────────────────────────────┐         │
+│  │ 7. Unnormalize                                │         │
+│  │    反归一化到原始动作范围                      │         │
+│  └──────────────────────────────────────────────┘         │
+│                            │                               │
+│  ┌──────────────────────────────────────────────┐         │
+│  │ 8. LiberoOutputs.__call__()                   │         │
+│  │    提取前 7 维动作                            │         │
+│  └──────────────────────────────────────────────┘         │
+│                            │                               │
+└────────────────────────────┼───────────────────────────────┘
+                            ↓
+            {"actions": [action_horizon, 7]}
+                            │
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 客户端：执行动作                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**训练 vs 推理**
+
+转换器在训练和推理阶段都会使用，但行为略有不同：
+
+| 阶段 | LiberoInputs 输入 | LiberoInputs 行为 | LiberoOutputs 使用 |
+|------|------------------|------------------|-------------------|
+| **训练** | LeRobot 数据集<br/>（float32, CHW 格式） | - 解析图像格式<br/>- 添加掩码<br/>- **保留 actions 字段** | **不使用**<br/>（损失直接在模型维度计算） |
+| **推理** | 客户端观察<br/>（uint8, HWC 格式） | - 跳过格式解析<br/>- 添加掩码<br/>- 无 actions 字段 | **使用**<br/>提取前 7 维动作 |
+
+**配置位置**
+
+这些转换器在训练配置中定义（[config.py#L312-L325](../../src/openpi/training/config.py#L312-L325)）：
+
+```python
+# pi0_libero, pi0_libero_low_mem_finetune, pi05_libero 配置
+data_transforms = _transforms.Group(
+    inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
+    outputs=[libero_policy.LiberoOutputs()],
+)
+```
+
+这个配置会被保存在检查点中，推理时自动加载。
+
 #### 3.4 PI0 模型推理
 
 PI0 模型的核心推理逻辑位于 [../../src/openpi/models/pi0.py](../../src/openpi/models/pi0.py)。
@@ -239,49 +497,117 @@ return x_0  # 返回去噪后的动作序列
 }
 ```
 
-### 5. 流程图
+### 5. 完整数据流程图
 
 ```
 [LIBERO 环境] ──观察──> [客户端 main.py]
                            │
                            │ element = {
-                           │   "observation/image": img,
-                           │   "observation/wrist_image": wrist_img,
-                           │   "observation/state": state,
-                           │   "prompt": task_description
+                           │   "observation/image": [224,224,3] uint8,
+                           │   "observation/wrist_image": [224,224,3] uint8,
+                           │   "observation/state": [8] float32,
+                           │   "prompt": "task description"（third_party/libero/libero/libero/benchmark/libero_suite_task_map.py）
                            │ }
                            ↓
                    [WebSocket Client] ──msgpack──> [WebSocket Server]
                                                            │
-                                                           │ obs
+                                                           │ 接收原始观察
                                                            ↓
                                                     [Policy.infer()]
                                                            │
-                                                           │ 数据转换
+                                    ┌──────────────────────┴──────────────────────┐
+                                    │        数据转换流水线                        │
+                                    │                                              │
+                                    │  ① InjectDefaultPrompt                      │
+                                    │     └─> 注入默认任务提示（如果需要）          │
+                                    │                                              │
+                                    │  ② LiberoInputs.__call__()                  │
+                                    │     ├─> 解析图像格式 (uint8, HWC)           │
+                                    │     ├─> 组织多视角: base/left/right wrist  │
+                                    │     ├─> 添加图像掩码 (True/False)           │
+                                    │     └─> 输出: {state, image, image_mask,    │
+                                    │              prompt}                        │
+                                    │                                              │
+                                    │  ③ Normalize                                │
+                                    │     └─> 使用预计算统计量归一化数据            │
+                                    │                                              │
+                                    │  ④ ModelTransforms                          │
+                                    │     ├─> 分词化提示 (Gemma tokenizer)        │
+                                    │     ├─> 填充动作到模型维度                   │
+                                    │     └─> 构造 Observation 对象                │
+                                    │                                              │
+                                    └──────────────────────┬──────────────────────┘
+                                                           │
                                                            ↓
                                                     [PI0.sample_actions()]
                                                            │
-                                                           ├─> [embed_prefix()] 编码图像+语言
-                                                           │   └─> SigLIP + Gemma
+                                    ┌──────────────────────┴──────────────────────┐
+                                    │      流匹配推理过程                          │
+                                    │                                              │
+                                    │  ① embed_prefix(observation)                │
+                                    │     ├─> SigLIP: 图像 → patch tokens         │
+                                    │     └─> Gemma: 提示 → text tokens           │
+                                    │                                              │
+                                    │  ② 构建 KV 缓存                              │
+                                    │     └─> 前缀一次前向传播，缓存 K,V           │
+                                    │                                              │
+                                    │  ③ ODE 积分循环 (t=1→0, 10步)               │
+                                    │     ├─> embed_suffix(噪声动作, 时间t)        │
+                                    │     ├─> Transformer 预测速度场 v_t           │
+                                    │     └─> 欧拉积分: x_{t+dt} = x_t + dt*v_t   │
+                                    │                                              │
+                                    │  ④ 返回去噪后的动作 x_0                      │
+                                    │     └─> shape: [batch, action_horizon,       │
+                                    │                action_dim]                   │
+                                    │                                              │
+                                    └──────────────────────┬──────────────────────┘
                                                            │
-                                                           ├─> [构建 KV 缓存]
+                                                           │ 模型输出
+                                                           ↓
+                                    ┌──────────────────────┴──────────────────────┐
+                                    │        输出转换流水线                        │
+                                    │                                              │
+                                    │  ① ModelTransforms (outputs)                │
+                                    │     └─> 移除模型特定包装                      │
+                                    │                                              │
+                                    │  ② Unnormalize                              │
+                                    │     └─> 反归一化到原始动作范围                │
+                                    │                                              │
+                                    │  ③ LiberoOutputs.__call__()                 │
+                                    │     └─> 提取前 7 维动作                      │
+                                    │                                              │
+                                    └──────────────────────┬──────────────────────┘
                                                            │
-                                                           └─> [ODE 积分循环]
-                                                               ├─> [embed_suffix()] 编码噪声动作+时间
-                                                               ├─> [Transformer] 预测速度场
-                                                               └─> [欧拉积分] 更新动作
-                                                                   │ (重复 num_steps 次)
-                                                                   ↓
-                                                           返回去噪后的动作
-                                                           │
+                                                           │ {"actions": [15, 7]}
+                                                           ↓
                    [WebSocket Client] <──msgpack── [WebSocket Server]
                            │
-                           │ actions: [action_horizon, 7]
+                           │ action_chunk: [action_horizon, 7]
+                           │ 缓存前 replan_steps (5) 个动作
                            ↓
-              [客户端执行前 replan_steps 步]
+              [客户端逐步执行缓存的动作]
                            │
+                           │ 每步: env.step(action)
+                           ↓
 [LIBERO 环境] <──action──┘
+              │
+              └─> 返回新的观察 obs，重复上述流程
 ```
+
+**关键数据维度说明：**
+
+| 位置 | 数据项 | 维度 | 类型 | 说明 |
+|------|--------|------|------|------|
+| 客户端发送 | observation/image | [224, 224, 3] | uint8 | 主摄像头 RGB 图像 |
+| 客户端发送 | observation/wrist_image | [224, 224, 3] | uint8 | 腕部摄像头 RGB 图像 |
+| 客户端发送 | observation/state | [8] | float32 | 机器人状态（位置+姿态+夹爪） |
+| LiberoInputs 输出 | state | [8] | float32 | 同上 |
+| LiberoInputs 输出 | image (3视角) | [224, 224, 3] × 3 | uint8 | base, left_wrist, right_wrist |
+| LiberoInputs 输出 | image_mask | 3个布尔值 | bool | 标识有效/填充图像 |
+| 归一化后 | state | [8] | float32 | 归一化到 [-1, 1] 或标准分布 |
+| 模型推理后 | actions | [15, action_dim] | float32 | action_dim 可能 > 7（填充） |
+| LiberoOutputs 输出 | actions | [15, 7] | float32 | 只保留前 7 维 |
+| 客户端缓存 | action_plan | [5, 7] | float32 | 只缓存前 5 个动作 |
 
 ## 使用 Docker（推荐）
 
@@ -454,10 +780,10 @@ graph LR
 ```
 
 **关键代码路径：**
-1. [../../scripts/serve_policy.py#L73-L76](../../scripts/serve_policy.py#L73-L76) - 定义 LIBERO 默认检查点
-2. [../../src/openpi/shared/download.py](../../src/openpi/shared/download.py) - 下载模型文件
-3. [../../src/openpi/policies/policy_config.py#L57](../../src/openpi/policies/policy_config.py#L57) - 创建训练好的策略
-4. [../../src/openpi/serving/websocket_policy_server.py](../../src/openpi/serving/websocket_policy_server.py) - WebSocket 服务器实现
+1. [serve_policy.py#L73-L76](../../scripts/serve_policy.py#L73-L76) - 定义 LIBERO 默认检查点
+2. [download.py](../../src/openpi/shared/download.py) - 下载模型文件
+3. [policy_config.py#L57](../../src/openpi/policies/policy_config.py#L57) - 创建训练好的策略
+4. [websocket_policy_server.py](../../src/openpi/serving/websocket_policy_server.py) - WebSocket 服务器实现
 
 #### 3. 评估循环
 

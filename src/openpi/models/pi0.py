@@ -327,7 +327,7 @@ class Pi0(_model.BaseModel):
         
         # 使用正弦-余弦位置编码嵌入时间步
         # 对 [0, 1] 范围提供敏感性，适合流匹配的时间参数
-        time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
+        time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0) # [batch, embed_dim]
         
         if self.pi05:
             # PI0.5：使用 adaRMS 动态注入时间信息
@@ -343,7 +343,7 @@ class Pi0(_model.BaseModel):
         else:
             # PI0：使用 MLP 显式融合时间和动作信息（无 adaRMS）
             # 将时间嵌入扩展到所有动作步
-            time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
+            time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon) # [batch, action_horizon, embed_dim]
             
             # 拼接动作和时间嵌入：[batch, action_horizon, 2*embed_dim]
             action_time_tokens = jnp.concatenate([action_tokens, time_tokens], axis=-1)
@@ -358,7 +358,7 @@ class Pi0(_model.BaseModel):
             
         # 添加处理后的动作 tokens
         tokens.append(action_expert_tokens)
-        input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
+        input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))  # [batch, action_horizon]
         
         # 设置动作序列的因果注意力掩码
         # 第一个动作 token：图像/语言/状态输入不能关注动作 tokens（True）
@@ -413,10 +413,10 @@ class Pi0(_model.BaseModel):
         # 2. 采样时间步 t ∈ [0.001, 0.999]
         # 使用 Beta(1.5, 1) 分布，更多采样在接近 1 的区域
         # 避免端点 0 和 1 以提高数值稳定性
-        time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
+        time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001 # shape [batch]
         
         # 3. 构造插值路径：x_t = t*噪声 + (1-t)*真实动作
-        time_expanded = time[..., None, None]  # 广播到动作维度
+        time_expanded = time[..., None, None]  # 广播到动作维度，shape [batch, 1, 1]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         
         # 4. 计算目标速度场：u_t = 噪声 - 真实动作

@@ -295,13 +295,13 @@ def preprocess_observation(
 
     out_images = {}
     for key in image_keys:
-        image = observation.images[key]
+        image = observation.images[key] # shape: [*b, h, w, c]
         # 检查图像分辨率是否匹配，不匹配则调整
         # image.shape[1:3] 对应 (height, width)，跳过批次维度
         if image.shape[1:3] != image_resolution:
             logger.info(f"Resizing image {key} from {image.shape[1:3]} to {image_resolution}")
             # 使用带填充的调整大小，保持纵横比
-            image = image_tools.resize_with_pad(image, *image_resolution)
+            image = image_tools.resize_with_pad(image, *image_resolution) # shape: [*b, IMAGE_RESOLUTION[0], IMAGE_RESOLUTION[1], c]
 
         if train:
             # 将图像从 [-1, 1] 转换到 [0, 1] 范围，因为 augmax 期望此格式
@@ -344,7 +344,8 @@ def preprocess_observation(
     for key in out_images:
         if key not in observation.image_masks:
             # 如果没有提供掩码，默认所有图像都有效（全为 True）
-            out_masks[key] = jnp.ones(batch_shape, dtype=jnp.bool)
+            out_masks[key] = jnp.ones(batch_shape, dtype=jnp.bool) 
+            # out_masks shape: [key_dim, *b]
         else:
             # 使用提供的掩码，确保是 JAX 数组格式
             out_masks[key] = jnp.asarray(observation.image_masks[key])
