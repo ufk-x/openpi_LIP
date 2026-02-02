@@ -43,37 +43,41 @@ logger = logging.getLogger("openpi")
 
 
 def make_attn_mask(input_mask, mask_ar):
-    """构建灵活的注意力掩码，支持多种注意力模式（改编自 big_vision）。
-    
-    核心思想：
-    tokens 只能关注到累积 mask_ar 值小于或等于自己的有效输入 tokens。
-    通过 mask_ar bool[?B, N] 可以设置多种注意力类型。
-    
-    注意力模式示例：
-    
-    1. 纯因果注意力：
-       [[1 1 1 1 1 1]]: 每个 token 只能看到之前的 tokens（标准 GPT 模式）
-    
-    2. 前缀-LM 注意力：
-       [[0 0 0 1 1 1]]: 前3个 tokens 可以互相关注（双向），
-                        后3个 tokens 只能因果关注。用于处理输入前缀 + 生成后缀。
-                        第一个条目也可以是 1，行为不变。
-    
-    3. 分块因果注意力：
-       [[1 0 1 0 1 0 0 1 0 0]]: 4个块之间的因果注意力。
-                                 块内 tokens 可以关注所有之前的块和同块内的所有 tokens。
-    
-    在 PI0 中的应用：
-    - 图像和语言 tokens：mask_ar = False（全连接注意力）
-    - 动作 tokens：mask_ar = True（因果注意力，防止未来信息泄露）
-    
-    Args:
-      input_mask: bool[B, N] 为真表示是输入的一部分，为假表示填充
-      mask_ar: bool[?B, N] 为真表示之前的 tokens 不能依赖它，
-               为假表示与之前的 token 共享相同的注意力掩码
-               
-    Returns:
-      bool[B, N, N] 注意力掩码，attn_mask[b, i, j] 为真表示 token i 可以关注 token j
+    """构建注意力掩码（改编自 big_vision），用 `mask_ar` 表达“分块 + 因果”的信息流。
+
+     这套掩码的关键不是“True/False 直接表示因果/非因果”，而是：
+     `mask_ar` 定义了一个随序列位置递增的“块编号（block id）”。
+
+     具体规则：
+     - 令 `cumsum = cumsum(mask_ar, axis=1)`（对 True/1 做累加）。
+     - token i 允许关注 token j 当且仅当：`cumsum[j] <= cumsum[i]`。
+
+     因此：
+     - **同一块（cumsum 相同）内是双向注意力**（块内 token 互相可见）。
+     - **块与块之间是因果方向**：后面的块可以看前面的块，前面的块看不到后面的块。
+
+     这使得 `mask_ar` 可以非常紧凑地表达多种注意力模式：
+
+     1) 纯因果（标准 GPT）：
+         `mask_ar = [1 1 1 1 1 1]` -> `cumsum = [1 2 3 4 5 6]`，从而只能看见自己及之前。
+
+     2) Prefix-LM（前缀双向 + 后缀因果）：
+         `mask_ar = [0 0 0 1 1 1]` -> 前 3 个 token 同块双向；后缀 token 之间因果，且后缀可看前缀。
+
+     3) 分块因果（块内双向、块间因果）：
+         例如 `mask_ar = [1 0 0 1 0 0 1 0 0]` 表示 3 个块；每个块内双向，但块 2/3 能看块 1。
+
+     在 PI0/PI0.5 中的用途（最重要）：
+     - 让 prefix（图像/语言条件）内部双向融合；
+     - 同时确保 prefix **不能**关注到 suffix（状态/动作），避免训练/推理时信息泄露；
+     - suffix 仍可以看 prefix，以利用条件进行动作去噪/预测。
+
+     Args:
+        input_mask: bool[B, N]，True 表示有效 token，False 表示 padding。
+        mask_ar: bool[?B, N]，True 表示“从这里开始进入新块”，False 表示“与前一个 token 同块”。
+
+     Returns:
+        bool[B, N, N] 注意力掩码；attn_mask[b, i, j] 为 True 表示 token i 可以关注 token j。
     """
     mask_ar = jnp.broadcast_to(mask_ar, input_mask.shape) # shape [b, n]
     cumsum = jnp.cumsum(mask_ar, axis=1) # shape [b, n]
@@ -360,9 +364,14 @@ class Pi0(_model.BaseModel):
         tokens.append(action_expert_tokens)
         input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))  # [batch, action_horizon]
         
-        # 设置动作序列的因果注意力掩码
-        # 第一个动作 token：图像/语言/状态输入不能关注动作 tokens（True）
-        # 其余动作 tokens：可以因果关注之前的动作 tokens（False）
+        # 设置动作序列的注意力掩码（分块因果：块内双向、块间因果）
+        # 这里的 `ar_mask` 采用“分块因果”语义（见 make_attn_mask 的 docstring）：
+        # - `True` 表示“从这里开始一个新块”（block id +1）
+        # - `False` 表示“与上一个 token 同块”
+        # 因此：
+        # - 令第一个动作 token 为 True，可以确保 prefix 看不到动作（防止信息泄露）
+        # - 后续动作 token 为 False，表示整段 action_horizon 处在同一块内：动作 token 之间是**双向注意力**
+        #   （这更符合 flow matching/扩散式“整段轨迹联合去噪”的建模方式，而非自回归逐步生成）。
         ar_mask += [True] + ([False] * (self.action_horizon - 1))
         
         # 拼接所有后缀 tokens

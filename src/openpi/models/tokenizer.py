@@ -67,7 +67,7 @@ class FASTTokenizer:
         cleaned_text = prompt.lower().strip().replace("_", " ")
 
         # Convention: state gets discretized into 256 discrete bins (assumed range after normalization: [-1, 1])
-        discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+        discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1 # 返回每个状态值所属的 bin 索引，因为 np.digitize 返回的是从 1 开始的索引，所以减 1 变成 0-based 索引
 
         # Convention: prefix includes prompt and string-representation of state, followed by ';'
         state_str = " ".join(map(str, discretized_state))
