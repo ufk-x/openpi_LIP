@@ -12,7 +12,7 @@ from openpi.shared import array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 
 if TYPE_CHECKING:
-    from openpi.models.pi0 import Pi0
+    from openpi.models.pi0_backup import Pi0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -47,7 +47,7 @@ class Pi0Config(_model.BaseModelConfig):
 
     @override
     def create(self, rng: at.KeyArrayLike) -> "Pi0":
-        from openpi.models.pi0 import Pi0
+        from openpi.models.pi0_backup import Pi0
 
         return Pi0(self, rngs=nnx.Rngs(rng))
 

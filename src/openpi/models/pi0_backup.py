@@ -24,9 +24,7 @@ PI0 vs PI0.5：
 - 多模态指令跟随
 """
 
-import functools
 import logging
-from typing import Literal, TypeAlias
 
 import einops
 import flax.nnx as nnx
@@ -88,46 +86,6 @@ def make_attn_mask(input_mask, mask_ar):
     return jnp.logical_and(attn_mask, valid_mask) # shape [b, n, n]
 
 
-PrefixAttentionSchedule: TypeAlias = Literal["linear", "exp", "ones", "zeros"]
-
-
-def get_prefix_weights(
-    start: int, end: int, total: int, schedule: PrefixAttentionSchedule
-) -> jax.Array:
-    """计算前缀注意力权重，用于 realtime guidance 中控制哪些动作步应与上一轮 chunk 保持一致。
-
-    直觉：start 之前的动作步已经被执行，必须完全匹配（权重=1）；
-    start 到 end 之间的动作步逐渐衰减（允许部分偏离）；
-    end 之后的动作步不再关注上一轮 chunk（权重=0）。
-
-    示例: start=2, end=6, total=10 时:
-        1  1  4/5 3/5 2/5 1/5 0  0  0  0
-               ^              ^
-             start           end
-
-    Args:
-        start: 允许开始变化的位置（inclusive），通常等于 inference_delay
-        end: 停止关注前缀的位置（exclusive），通常等于 prefix_attention_horizon
-        total: 动作 chunk 的总长度（action_horizon）
-        schedule: 权重衰减策略，"linear" / "exp" / "ones" / "zeros"
-
-    Returns:
-        权重数组，形状 [total]，值域 [0, 1]
-    """
-    start = jnp.minimum(start, end)
-    if schedule == "ones":
-        w = jnp.ones(total)
-    elif schedule == "zeros":
-        w = (jnp.arange(total) < start).astype(jnp.float32)
-    elif schedule == "linear" or schedule == "exp":
-        w = jnp.clip((start - 1 - jnp.arange(total)) / (end - start + 1) + 1, 0, 1)
-        if schedule == "exp":
-            w = w * jnp.expm1(w) / (jnp.e - 1)
-    else:
-        raise ValueError(f"Invalid schedule: {schedule}")
-    return jnp.where(jnp.arange(total) >= end, 0, w)
-
-
 @at.typecheck
 def posemb_sincos(
     pos: at.Real[at.Array, " b"], embedding_dim: int, min_period: float, max_period: float
@@ -171,10 +129,6 @@ def posemb_sincos(
     )
     return jnp.concatenate([jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)], axis=-1)
 
-CHUNK_SIZE = 10  # 用于 realtime guidance 的 action chunk 大小
-REPLAN_STEPS = 2  # 每次 replanning 时的重叠步数，论文中的execute_horizon
-DELAY_STEPS = 1 # 严格要求： DELAY_STEPS <= CHUNK_SIZE - REPLAN_STEPS （prefix_attention_horizon）
-RTC_GUIDANCE = True  # 是否启用 realtime guidance
 
 class Pi0(_model.BaseModel):
     """PI0 多模态机器人策略模型。
@@ -256,17 +210,6 @@ class Pi0(_model.BaseModel):
 
         # 训练/评估模式标志，由 model.train() 和 model.eval() 自动设置
         self.deterministic = True
-
-        # ---- Realtime guidance 状态（外部设置，sample_actions 内部读取） ----
-        # 设置 prev_action_chunk 为非 None 即可启用 realtime guidance，
-        # 无需修改 sample_actions 的调用方式。
-        self.prev_action_chunk: at.Float[at.Array, "b ah ad"] | None = None
-        self.rtc_guidance: bool = RTC_GUIDANCE
-        self.replan_steps: int = REPLAN_STEPS
-        self.guidance_inference_delay: int = DELAY_STEPS  # 默认 delay = action_horizon - replan_steps
-        self.guidance_prefix_attention_horizon: int = config.action_horizon - self.replan_steps
-        self.guidance_prefix_attention_schedule: PrefixAttentionSchedule = "exp"
-        self.guidance_max_weight: float = 5.0
 
     @at.typecheck
     def embed_prefix(
@@ -520,55 +463,6 @@ class Pi0(_model.BaseModel):
         # 在动作维度上求均值，返回每个时间步的损失
         return jnp.mean(jnp.square(v_t - u_t), axis=-1) # shape [batch, action_horizon]
 
-    def _predict_velocity(
-        self,
-        observation: _model.Observation,
-        x_t: at.Float[at.Array, "b ah ad"],
-        time: at.Float[at.Array, ""] | at.Float[at.Array, " b"],
-        prefix_tokens,
-        prefix_mask,
-        kv_cache,
-    ) -> at.Float[at.Array, "b ah ad"]:
-        """给定当前含噪动作 x_t 和时间步 time，预测速度场 v_t。
-
-        将前向推理封装为独立函数，便于 realtime guidance 中
-        通过 jax.vjp 对 denoiser 求梯度（伪逆校正项）。
-
-        Args:
-            observation: 观察数据
-            x_t: 当前含噪动作，形状 [batch, action_horizon, action_dim]
-            time: 当前时间步（标量或 [batch]）
-            prefix_tokens: 前缀 tokens（已编码，缓存）
-            prefix_mask: 前缀 input_mask
-            kv_cache: 前缀 KV 缓存
-
-        Returns:
-            速度场 v_t，形状 [batch, action_horizon, action_dim]
-        """
-        batch_size = x_t.shape[0]
-        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-            observation, x_t, jnp.broadcast_to(time, batch_size)
-        )
-
-        suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
-        pfx_attn = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
-        full_attn_mask = jnp.concatenate([pfx_attn, suffix_attn_mask], axis=-1)
-
-        positions = (
-            jnp.sum(prefix_mask, axis=-1)[:, None]
-            + jnp.cumsum(suffix_mask, axis=-1)
-            - 1
-        )
-
-        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-            [None, suffix_tokens],
-            mask=full_attn_mask,
-            positions=positions,
-            kv_cache=kv_cache,
-            adarms_cond=[None, adarms_cond],
-        )
-        return self.action_out_proj(suffix_out[:, -self.action_horizon :])
-
     @override
     def sample_actions(
         self,
@@ -578,136 +472,112 @@ class Pi0(_model.BaseModel):
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
-        """通过流匹配采样生成动作序列，可选 realtime guidance。
-
-        Realtime guidance 通过实例属性控制，无需修改此 API 的调用方式：
-        - 设置 self.prev_action_chunk 为上一轮 action chunk 即可启用引导；
-        - 设置为 None 则退化为原始的纯 ODE 采样。
-
-        相关实例属性（在 __init__ 中初始化，可外部修改）：
-        - prev_action_chunk: 上一轮 action chunk [batch, ah, ad]，None 时禁用引导
-        - guidance_inference_delay: 已执行的动作步数（权重=1 的区间）
-        - guidance_prefix_attention_horizon: 引导关注范围上界
-        - guidance_prefix_attention_schedule: 权重衰减策略
-        - guidance_max_weight: 引导权重上限
-
-        核心数学（已适配 PI0 的时间约定 t: 1→0）：
-        1. denoiser: hat_x_0 = x_t - t * v_t   （从含噪动作预测干净动作）
-        2. error = (prev_chunk - hat_x_0) * weights  （重叠部分的偏差）
-        3. pinv_correction = vjp(denoiser, error)  （伪逆校正梯度）
-        4. guidance_weight = min(c * inv_r2, max_weight)
-           其中 c = t / (1-t), inv_r2 = (t^2 + (1-t)^2) / t^2
-        5. v_guided = v_t + guidance_weight * pinv_correction
-
+        """通过流匹配采样生成动作序列。
+        
+        实现从噪声到目标分布的ODE积分过程：
+        1. 从纯噪声开始（t=1）
+        2. 沿着学习到的速度场积分到目标分布（t=0）
+        3. 使用欧拉方法进行数值积分
+        
+        相比扩散模型的优势：
+        - 确定性采样过程（给定噪声）
+        - 更少的采样步数（通常10-50步 vs 1000步）
+        - 更好的采样质量和速度
+        
+        优化技术：
+        - KV 缓存：前缀部分只计算一次，重复使用
+        - 增量解码：每步只处理后缀部分
+        
         Args:
             rng: JAX 随机数生成器
             observation: 观察数据，作为生成条件
-            num_steps: ODE 积分步数
+            num_steps: ODE 积分步数，更多步数通常有更好质量
             noise: 初始噪声，如果为 None 则随机采样
-
         Returns:
             生成的动作序列，形状 [batch, action_horizon, action_dim]
         """
         # 预处理观察数据（推理模式，无数据增强）
         observation = _model.preprocess_observation(None, observation, train=False)
-
-        # PI0 时间约定: t=1 是噪声，t=0 是目标分布，dt < 0
-        dt = -1.0 / num_steps
+        
+        # 注意：我们使用扩散文献中更常见的约定，其中 t=1 是噪声，t=0 是目标分布
+        # 是的，这与 PI0 论文相反，抱歉造成困扰
+        dt = -1.0 / num_steps  # 时间步长（负数，从 1 到 0）
         batch_size = observation.state.shape[0]
-
+        
+        # 初始化噪声（如果未提供）
         if noise is None:
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
-        # 从实例属性读取 realtime guidance 配置
-        prev_action_chunk = self.prev_action_chunk
-        use_guidance = self.rtc_guidance and (prev_action_chunk is not None)
-        inference_delay = self.guidance_inference_delay
-        prefix_attention_horizon = self.guidance_prefix_attention_horizon
-        prefix_attention_schedule = self.guidance_prefix_attention_schedule
-        max_guidance_weight = self.guidance_max_weight
-
-        # ---- 构建前缀 KV 缓存（只算一次） ----
+        # 优化：首先用前缀的前向传播填充 KV 缓存
+        # 这样前缀部分只需要计算一次，后续步骤可以重复使用
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
-        pos = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm(
-            [prefix_tokens, None], mask=prefix_attn_mask, positions=pos
-        )
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        
+        # 只处理前缀，构建 KV 缓存
+        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions) # prefix_out is not used, kv_cache is for prefix, shape [batch, prefix_len, embed_dim]
 
         def step(carry):
-            """ODE 积分的单步更新，可选 realtime guidance 校正。"""
+            """ODE 积分的单步更新。
+            
+            Args:
+                carry: (当前状态 x_t, 当前时间 t)
+                
+            Returns:
+                (下一状态 x_{t+dt}, 下一时间 t+dt)
+            """
             x_t, time = carry
+            
+            # 编码当前状态和时间
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                observation, x_t, jnp.broadcast_to(time, batch_size)
+            )
+            
+            # 构造注意力掩码
+            # suffix_attn_mask: 后缀 tokens 之间的注意力 (b, suffix_len, suffix_len)
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            
+            # prefix_attn_mask: 后缀 tokens 对前缀 tokens 的注意力 (b, suffix_len, prefix_len)
+            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            
+            # full_attn_mask: 后缀 tokens 对完整序列的注意力 (b, suffix_len, prefix_len + suffix_len)
+            # 这控制查询（后缀）如何关注键值（前缀+后缀）
+            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1) # shape (b, suffix_len, prefix_len + suffix_len)
+            
+            assert full_attn_mask.shape == (
+                batch_size,
+                suffix_tokens.shape[1],
+                prefix_tokens.shape[1] + suffix_tokens.shape[1],
+            )
+            
+            # 计算后缀 tokens 的位置编码
+            # jnp.sum(prefix_mask, axis=-1)[:, None] => shape (b, 1)
+            # jnp.cumsum(suffix_mask, axis=-1) => shape (b, suffix_len)
+            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1 # shape (b, suffix_len)
 
-            if use_guidance:
-                # ---- realtime guidance 模式 ----
-                # 对 batch 中每个样本独立计算伪逆校正
-                @functools.partial(jax.vmap, in_axes=(0, 0, 0, None))
-                def pinv_corrected_velocity(obs_state, x_t_single, last_chunk, t):
-                    """计算带伪逆校正的速度场（单样本）。
+            # 增量前向传播：只处理后缀，重用前缀的 KV 缓存
+            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],  # 前缀为 None，使用缓存
+                mask=full_attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,     # 重用前缀的 KV 缓存
+                adarms_cond=[None, adarms_cond],
+            )
+            
+            assert prefix_out is None  # 确认前缀输出为空（使用缓存）
+            
+            # 预测当前时间步的速度场
+            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-                    Args:
-                        obs_state: 当前样本的 observation.state [state_dim]
-                        x_t_single: 当前含噪动作 [action_horizon, action_dim]
-                        last_chunk: 上一轮 action chunk [action_horizon, action_dim]
-                        t: 当前时间步（标量）
-                    """
-                    def denoiser(x_t_s):
-                        """从含噪动作预测干净动作 hat_x_0 = x_t - t * v_t。
-
-                        注意：这里将单样本扩展为 batch=1 以复用模型前向。
-                        返回 (hat_x_0, v_t)，其中 v_t 作为 has_aux 输出。
-                        """
-                        # 构造 batch=1 的输入
-                        x_t_batched = x_t_s[None]  # [1, ah, ad]
-                        v_t = self._predict_velocity(
-                            observation, x_t_batched, t, prefix_tokens, prefix_mask, kv_cache
-                        )[0]  # [ah, ad]
-                        hat_x_0 = x_t_s - t * v_t  # denoiser 输出
-                        return hat_x_0, v_t
-
-                    # jax.vjp 同时计算 denoiser 的输出和 VJP 函数
-                    hat_x_0, vjp_fun, v_t = jax.vjp(denoiser, x_t_single, has_aux=True)
-
-                    # 计算前缀权重，控制哪些动作步需要与上一轮保持一致
-                    weights = get_prefix_weights(
-                        inference_delay, prefix_attention_horizon,
-                        self.action_horizon, prefix_attention_schedule,
-                    )
-                    # error: 目标（上一轮 chunk）与当前预测之间的加权偏差
-                    error = (last_chunk - hat_x_0) * weights[:, None]  # [ah, ad]
-
-                    # 通过 VJP 计算伪逆校正项: d(denoiser)/d(x_t)^T @ error
-                    pinv_correction = vjp_fun(error)[0]  # [ah, ad]
-
-                    # ---- 计算引导权重（适配 PI0 时间约定 t: 1→0）----
-                    # 在 ref 中 t_ref: 0→1, c = (1-t_ref)/t_ref, inv_r2 = (t_ref^2+(1-t_ref)^2)/(1-t_ref)^2
-                    # PI0 中 t: 1→0, 映射关系 t_ref = 1-t, 因此:
-                    #   c = t / (1-t)
-                    #   inv_r2 = (t^2 + (1-t)^2) / t^2
-                    inv_r2 = (t**2 + (1 - t) ** 2) / (t**2 + 1e-8)
-                    c = jnp.nan_to_num(t / (1 - t), posinf=max_guidance_weight)
-                    guidance_weight = jnp.minimum(c * inv_r2, max_guidance_weight)
-
-                    return v_t + guidance_weight * pinv_correction
-
-                v_t = pinv_corrected_velocity(
-                    observation.state, x_t, prev_action_chunk, time
-                )
-            else:
-                # ---- 原始模式：纯速度场，无引导 ----
-                v_t = self._predict_velocity(
-                    observation, x_t, time, prefix_tokens, prefix_mask, kv_cache
-                )
-
+            # 欧拉方法积分：x_{t+dt} = x_t + dt * v_t
             return x_t + dt * v_t, time + dt
 
         def cond(carry):
             """循环终止条件：时间是否到达 0。"""
-            _, time = carry
+            x_t, time = carry
+            # 对浮点误差保持鲁棒性
             return time >= -dt / 2
 
         # ODE 积分：从 t=1（纯噪声）到 t=0（目标分布）
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
-        if self.rtc_guidance:
-            self.prev_action_chunk = x_0  # 更新 prev_action_chunk 以供下一轮使用
         return x_0

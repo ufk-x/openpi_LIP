@@ -48,6 +48,11 @@ numpy==1.22.4
     # via
     #   -r examples/libero/requirements.in
     #   imageio
+    #   pandas
+pandas==1.5.3
+    # via -r examples/libero/requirements.in
+pytz==2024.2
+    # via pandas
     #   matplotlib
     #   mujoco
     #   numba
@@ -78,7 +83,9 @@ pyopengl==3.1.7
 pyparsing==3.1.4
     # via matplotlib
 python-dateutil==2.9.0.post0
-    # via matplotlib
+    # via
+    #   matplotlib
+    #   pandas
 python-xlib==0.33
     # via pynput
 pyyaml==6.0.2

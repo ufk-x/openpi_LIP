@@ -319,19 +319,21 @@ class Pi0FAST(_model.BaseModel):
         prefix_start = prefill_size - prefill_len  # 每个样本有效区间起点（右对齐后）shape:[b]
 
         # 3) Prefill：用一次前向把 prefix 写入 KV cache。
-        # decode=True 表示走“带 KV cache 的解码模式”。
-        # 我们需要把 attention mask 的 key 维度 pad 到 s+T，提前为未来生成步预留 cache 槽位。
+        # 我们需要把 attention mask 的 key 维度 pad 到 s+T，提前为未来生成步预留 cache 槽位。就是使得mask的维度和 cache 对齐。
+        # prefix_attn_mask: shape:[b,s,s] -> [b,s,s+T]
         prefix_attn_mask = jnp.pad(
             prefix_attn_mask,
-            ((0, 0), (0, 0), (0, max_decoding_steps)),
+            ((0, 0), (0, 0), (0, max_decoding_steps)), # 0，1 2 维度不变，3 维度后面 pad T 个 False
         )  # 扩展 KV 长度 shape:[b,s,s+T]
 
         # prefix_positions: 对有效 token 从 0 开始递增，padding 处会得到 -1（通常在实现里会被 mask 掉）
         # shape:[b,s]
         prefix_positions = jnp.cumsum(prefix_mask, axis=-1) - 1  # prefix 位置编码 shape:[b,s]
+        # decode=True 表示走“带 KV cache 的解码模式”。
         prefix_logits, kv_cache, _ = self.PaliGemma.llm(
             embedded_prefix=prefix_token_embeddings, mask=prefix_attn_mask, positions=prefix_positions, decode=True
         )  # 预填充 KV cache，logits shape:[b,s,vocab]
+        # kv_cache shape: 内部结构由 PaliGemma 实现决定
 
         # 4) 初始化解码。
         # prefix_logits 的最后一个位置对应“prefix 最后一个输入 token”的预测分布，
