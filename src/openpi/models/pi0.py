@@ -171,10 +171,6 @@ def posemb_sincos(
     )
     return jnp.concatenate([jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)], axis=-1)
 
-CHUNK_SIZE = 10  # 用于 realtime guidance 的 action chunk 大小
-REPLAN_STEPS = 2  # 每次 replanning 时的重叠步数，论文中的execute_horizon
-DELAY_STEPS = 1 # 严格要求： DELAY_STEPS <= CHUNK_SIZE - REPLAN_STEPS （prefix_attention_horizon）
-RTC_GUIDANCE = True  # 是否启用 realtime guidance
 
 class Pi0(_model.BaseModel):
     """PI0 多模态机器人策略模型。
@@ -261,10 +257,10 @@ class Pi0(_model.BaseModel):
         # 设置 prev_action_chunk 为非 None 即可启用 realtime guidance，
         # 无需修改 sample_actions 的调用方式。
         self.prev_action_chunk: at.Float[at.Array, "b ah ad"] | None = None
-        self.rtc_guidance: bool = RTC_GUIDANCE
-        self.replan_steps: int = REPLAN_STEPS
-        self.guidance_inference_delay: int = DELAY_STEPS  # 默认 delay = action_horizon - replan_steps
-        self.guidance_prefix_attention_horizon: int = config.action_horizon - self.replan_steps
+        self.rtc_guidance: bool = False
+        self.replan_steps: int = 5
+        self.guidance_inference_delay: int = 5  
+        self.guidance_prefix_attention_horizon: int = config.action_horizon - self.replan_steps # 要求prefix_attention_horizon >= delay_steps
         self.guidance_prefix_attention_schedule: PrefixAttentionSchedule = "exp"
         self.guidance_max_weight: float = 5.0
 

@@ -14,14 +14,13 @@ from openpi_client import image_tools
 from openpi_client import websocket_client_policy as _websocket_client_policy
 import tqdm
 import tyro
+from typing import Literal, Optional
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # 渲染训练数据使用的分辨率
-
 CHUNK_SIZE = 10  # 用于 realtime guidance 的 action chunk 大小
-REPLAN_STEPS = 2  # 每次 replanning 时的重叠步数，论文中的execute_horizon
-DELAY_STEPS = 1 # 严格要求： DELAY_STEPS <= CHUNK_SIZE - REPLAN_STEPS （prefix_attention_horizon）
-RTC_GUIDANCE = True  # 是否启用 realtime guidance
+
+PrefixAttentionSchedule = Literal["linear", "exp", "ones", "zeros"]
 
 @dataclasses.dataclass
 class Args:
@@ -31,7 +30,6 @@ class Args:
     host: str = "0.0.0.0"
     port: int = 8000
     resize_size: int = 224
-    replan_steps: int = REPLAN_STEPS # action chunk只有10步，replan_steps需要小于等于这个值
 
     #################################################################################################################
     # LIBERO 环境参数
@@ -42,21 +40,24 @@ class Args:
     num_steps_wait: int = 10  # 等待物体在仿真中稳定的步数
     num_trials_per_task: int = 10  # 每个任务的评估回合数
 
+
     #################################################################################################################
-    # 推理延迟参数（参考 eval_flow.py）
+    # Realtime guidance (RTC) 参数，会传递到模型的 sample_actions 实例属性
     #################################################################################################################
-    inference_delay: int = DELAY_STEPS  # 模拟推理延迟的环境步数（0 = 无延迟）
-    # 要求：replan_steps + inference_delay <= action chunk(10)
+    rtc_flag: bool = False  # 是否启用 realtime guidance
+    replan_steps: int = 5  # 每次 replanning 的执行步数（execute_horizon）
+    delay_steps: int = 5  # 推理延迟步数
+    guidance_prefix_attention_schedule: PrefixAttentionSchedule = "exp"  # prefix attention 调度方式
+    guidance_max_weight: float = 5.0
 
     #################################################################################################################
     # 工具参数
     #################################################################################################################
-    video_out_path: str = "data/libero/videos"+str(task_suite_name)  # 视频保存路径
-    delay_video_out_path: str = "data/libero/delay_videos"+str(task_suite_name)  # 带模拟推理延迟的视频保存路径
-    csv_out_path: str = f"data/libero/eval_results_delay{inference_delay}_replan{replan_steps}_rtc{RTC_GUIDANCE}.csv"  # 评估结果 CSV 保存路径
+    video_out_path: str = ""  # 视频保存路径（留空则根据参数自动生成）
+    delay_video_out_path: str = ""  # 带模拟推理延迟的视频保存路径（留空则根据参数自动生成）
+    csv_out_path: str = ""  # 评估结果 CSV 保存路径（留空则根据参数自动生成）
 
     seed: int = 7  # 随机种子（用于复现）
-
 
 def _get_max_steps(task_suite_name: str) -> int:
     """返回指定任务套件的最大步数。"""
@@ -110,18 +111,26 @@ def eval_libero(args: Args) -> None:
 
     指标（每个任务的平均回合长度、累计奖励、成功率）输出到 `csv_out_path` 的 CSV 文件。
     """
+    # 动态生成输出路径（如果用户未显式指定）
+    if not args.video_out_path:
+        args.video_out_path = f"data/libero/videos_{args.task_suite_name}"
+    if not args.delay_video_out_path:
+        args.delay_video_out_path = f"data/libero/delay_videos_{args.task_suite_name}"
+    if not args.csv_out_path:
+        args.csv_out_path = f"data/libero/{args.task_suite_name}_results_delay{args.delay_steps}_replan{args.replan_steps}_rtc{args.rtc_flag}.csv"
+
     # 设置随机种子
     np.random.seed(args.seed)
 
     # 验证延迟参数
-    assert args.inference_delay >= 0, f"inference_delay 必须 >= 0，当前值: {args.inference_delay}"
-    # assert args.replan_steps > args.inference_delay, (
-    #     f"replan_steps ({args.replan_steps}) 必须 > inference_delay ({args.inference_delay})"
+    assert args.delay_steps >= 0, f"delay_steps 必须 >= 0，当前值: {args.delay_steps}"
+    # assert args.replan_steps > args.delay_steps, (
+    #     f"replan_steps ({args.replan_steps}) 必须 > delay_steps ({args.delay_steps})"
     # )
-    assert CHUNK_SIZE - args.replan_steps >= args.inference_delay, (
-        f"prefix_size[CHUNK_SIZE - replan_steps ({CHUNK_SIZE - args.replan_steps})] 必须 >= inference_delay ({args.inference_delay})"
+    assert CHUNK_SIZE - args.replan_steps >= args.delay_steps, (
+        f"prefix_size[CHUNK_SIZE - replan_steps ({CHUNK_SIZE - args.replan_steps})] 必须 >= delay_steps ({args.delay_steps})"
     )
-    use_delay = args.inference_delay > 0
+    use_delay = args.delay_steps > 0
     video_dir = args.delay_video_out_path if use_delay else args.video_out_path
 
     # 初始化 LIBERO 任务套件
@@ -129,7 +138,7 @@ def eval_libero(args: Args) -> None:
     task_suite = benchmark_dict[args.task_suite_name]()
     num_tasks_in_suite = task_suite.n_tasks
     max_steps = _get_max_steps(args.task_suite_name)
-    logging.info(f"Task suite: {args.task_suite_name} | inference_delay: {args.inference_delay}")
+    logging.info(f"Task suite: {args.task_suite_name} | delay_steps: {args.delay_steps} | replan_steps: {args.replan_steps} | rtc: {args.rtc_flag}")
 
     pathlib.Path(video_dir).mkdir(parents=True, exist_ok=True)
     pathlib.Path(args.csv_out_path).parent.mkdir(parents=True, exist_ok=True)
@@ -165,7 +174,7 @@ def eval_libero(args: Args) -> None:
             # `prev_chunk`        : 上一轮完整的 action chunk（用于延迟时提供「旧」动作）
             # `prev_chunk_offset` : prev_chunk 中下一个延迟动作的指针位置
             action_plan: collections.deque = collections.deque()
-            prev_chunk: np.ndarray | None = None
+            prev_chunk: Optional[np.ndarray] = None
             prev_chunk_offset: int = 0
 
             logging.info(f"Starting episode {task_episodes + 1}...")
@@ -194,16 +203,16 @@ def eval_libero(args: Args) -> None:
                         if use_delay and prev_chunk is not None:
                             # 模拟推理延迟模式（eval_flow.py 风格）：
                             #   前 `inference_delay` 个动作 -> 来自上一轮 chunk（「旧」动作）
-                            #   后 `replan_steps - inference_delay` 个动作 -> 来自新 chunk
+                            #   后 `replan_steps - delay_steps` 个动作 -> 来自新 chunk
                             delay_actions = []
-                            for d in range(args.inference_delay):
+                            for d in range(args.delay_steps):
                                 idx = prev_chunk_offset + d
                                 if idx < len(prev_chunk):
                                     delay_actions.append(prev_chunk[idx])
                                 else:
                                     # 上一轮 chunk 已耗尽，重复最后一个可用动作
                                     delay_actions.append(prev_chunk[-1])
-                            new_start = args.inference_delay
+                            new_start = args.delay_steps
                             new_end = args.replan_steps
                             combined = delay_actions + list(new_chunk[new_start:new_end])
                             action_plan.extend(combined)
@@ -241,10 +250,10 @@ def eval_libero(args: Args) -> None:
             # 保存回放视频
             suffix = "success" if done else "failure"
             task_segment = task_description.replace(" ", "_")
-            delay_tag = f"_delay{args.inference_delay}" if use_delay else ""
+            delay_tag = f"_delay{args.delay_steps}" if use_delay else ""
             replan_tag = f"_replan{args.replan_steps}"
             imageio.mimwrite(
-                pathlib.Path(video_dir) / f"rollout_rtc{RTC_GUIDANCE}_{task_segment}{delay_tag}{replan_tag}_{suffix}.mp4",
+                pathlib.Path(video_dir) / f"rollout_rtc{args.rtc_flag}_{task_segment}{delay_tag}{replan_tag}_{suffix}.mp4",
                 [np.asarray(x) for x in replay_images],
                 fps=10,
             )
@@ -262,7 +271,7 @@ def eval_libero(args: Args) -> None:
             "task_suite": args.task_suite_name,
             "task_id": task_id,
             "task_description": task_description,
-            "inference_delay": args.inference_delay,
+            "delay_steps": args.delay_steps,
             "replan_steps": args.replan_steps,
             "num_episodes": task_episodes,
             "successes": task_successes,

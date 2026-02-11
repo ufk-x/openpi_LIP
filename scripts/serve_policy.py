@@ -9,7 +9,7 @@ from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
 from openpi.serving import websocket_policy_server
 from openpi.training import config as _config
-
+from typing import Literal, TypeAlias
 
 class EnvMode(enum.Enum):
     """Supported environments."""
@@ -34,6 +34,7 @@ class Checkpoint:
 class Default:
     """Use the default policy for the given environment."""
 
+PrefixAttentionSchedule: TypeAlias = Literal["linear", "exp", "ones", "zeros"]
 
 @dataclasses.dataclass
 class Args:
@@ -53,6 +54,15 @@ class Args:
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
+
+    #################################################################################################################
+    # Realtime guidance (RTC) 参数，会传递到模型的 sample_actions 实例属性
+    #################################################################################################################
+    rtc: bool = False  # 是否启用 realtime guidance
+    replan_steps: int = 5  # 每次 replanning 的执行步数（execute_horizon）
+    delay_steps: int = 5  # 推理延迟步数
+    guidance_prefix_attention_schedule: PrefixAttentionSchedule = "exp"  # prefix attention 调度方式
+    guidance_max_weight: float = 5.0
 
 
 # Default checkpoints that should be used for each environment.
@@ -96,8 +106,25 @@ def create_policy(args: Args) -> _policy.Policy:
             return create_default_policy(args.env, default_prompt=args.default_prompt)
 
 
+def _apply_rtc_config(policy: _policy.Policy, args: Args) -> None:
+    """将 RTC guidance 参数写入底层模型实例属性。"""
+    model = policy._model
+    model.rtc_guidance = args.rtc
+    model.replan_steps = args.replan_steps
+    model.guidance_inference_delay = args.delay_steps
+    model.guidance_prefix_attention_horizon = model.action_horizon - args.replan_steps
+    model.guidance_prefix_attention_schedule = args.guidance_prefix_attention_schedule
+    model.guidance_max_weight = args.guidance_max_weight
+    logging.info(
+        "RTC config: rtc=%s, replan_steps=%d, delay_steps=%d, prefix_attention_horizon=%d, prefix_attention_schedule=%s, max_weight=%.2f",
+        args.rtc, args.replan_steps, args.delay_steps, model.action_horizon - args.replan_steps,
+        args.guidance_prefix_attention_schedule, args.guidance_max_weight,
+    )
+
+
 def main(args: Args) -> None:
     policy = create_policy(args)
+    _apply_rtc_config(policy, args)
     policy_metadata = policy.metadata
 
     # Record the policy's behavior.
