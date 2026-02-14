@@ -59,7 +59,7 @@ EXPERIMENTS: list[ExperimentConfig] = [
 
 # ---- 固定参数 ----
 PORT = 8000
-TASK_SUITE = "libero_10"
+TASK_SUITE = "libero_10" # 评测哪个任务集（ libero_spatial, libero_object, libero_goal, libero_10, libero_90 ）
 NUM_TRIALS = 10
 
 # ============================================================

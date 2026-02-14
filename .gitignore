@@ -1,7 +1,8 @@
 # Data directories.
 assets/
 checkpoints/
-data/
+data/*
+!data/paint_figure.py
 wandb/
 
 # Byte-compiled / optimized / DLL files
