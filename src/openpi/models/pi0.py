@@ -254,9 +254,9 @@ class Pi0(_model.BaseModel):
         self.deterministic = True
 
         # ---- Realtime guidance 状态（外部设置，sample_actions 内部读取） ----
-        # 设置 prev_action_chunk 为非 None 即可启用 realtime guidance，
+        # 设置 rtc_guidance_chunk 为非 None 即可启用 realtime guidance，
         # 无需修改 sample_actions 的调用方式。
-        self.prev_action_chunk: at.Float[at.Array, "b ah ad"] | None = None
+        self.rtc_guidance_chunk: at.Float[at.Array, "b ah ad"] | None = None
         self.rtc_guidance: bool = False
         self.replan_steps: int = 5
         self.guidance_inference_delay: int = 5  
@@ -577,11 +577,11 @@ class Pi0(_model.BaseModel):
         """通过流匹配采样生成动作序列，可选 realtime guidance。
 
         Realtime guidance 通过实例属性控制，无需修改此 API 的调用方式：
-        - 设置 self.prev_action_chunk 为上一轮 action chunk 即可启用引导；
+        - 设置 self.rtc_guidance_chunk 为引导目标 action chunk 即可启用引导；
         - 设置为 None 则退化为原始的纯 ODE 采样。
 
         相关实例属性（在 __init__ 中初始化，可外部修改）：
-        - prev_action_chunk: 上一轮 action chunk [batch, ah, ad]，None 时禁用引导
+        - rtc_guidance_chunk: 当前推理的引导目标 action chunk [batch, ah, ad]，None 时禁用引导
         - guidance_inference_delay: 已执行的动作步数（权重=1 的区间）
         - guidance_prefix_attention_horizon: 引导关注范围上界
         - guidance_prefix_attention_schedule: 权重衰减策略
@@ -615,8 +615,8 @@ class Pi0(_model.BaseModel):
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
         # 从实例属性读取 realtime guidance 配置
-        prev_action_chunk = self.prev_action_chunk
-        use_guidance = self.rtc_guidance and (prev_action_chunk is not None)
+        rtc_guidance_chunk = self.rtc_guidance_chunk
+        use_guidance = self.rtc_guidance and (rtc_guidance_chunk is not None)
         inference_delay = self.guidance_inference_delay
         prefix_attention_horizon = self.guidance_prefix_attention_horizon
         prefix_attention_schedule = self.guidance_prefix_attention_schedule
@@ -670,9 +670,11 @@ class Pi0(_model.BaseModel):
                         self.action_horizon, prefix_attention_schedule,
                     )
                     # error: 目标（上一轮 chunk）与当前预测之间的加权偏差
-                    error = (last_chunk - hat_x_0) * weights[:, None]  # [ah, ad]
+                    # error = (last_chunk - hat_x_0) * weights[:, None]  # [ah, ad]
+                    error = ( hat_x_0 - last_chunk) * weights[:, None]  # [ah, ad]，保持与扩散模型中“预测 vs 目标”的一致性（误差 = 预测 - 目标）
 
                     # 通过 VJP 计算伪逆校正项: d(denoiser)/d(x_t)^T @ error
+                    # @ 表示矩阵乘法，结果形状 [ah, ad]
                     pinv_correction = vjp_fun(error)[0]  # [ah, ad]
 
                     # ---- 计算引导权重（适配 PI0 时间约定 t: 1→0）----
@@ -687,7 +689,7 @@ class Pi0(_model.BaseModel):
                     return v_t + guidance_weight * pinv_correction
 
                 v_t = pinv_corrected_velocity(
-                    observation.state, x_t, prev_action_chunk, time
+                    observation.state, x_t, rtc_guidance_chunk, time
                 )
             else:
                 # ---- 原始模式：纯速度场，无引导 ----
@@ -704,6 +706,4 @@ class Pi0(_model.BaseModel):
 
         # ODE 积分：从 t=1（纯噪声）到 t=0（目标分布）
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
-        if self.rtc_guidance:
-            self.prev_action_chunk = x_0  # 更新 prev_action_chunk 以供下一轮使用
         return x_0
