@@ -85,16 +85,8 @@ def load_policy_once():
 
 
 def apply_rtc_config(policy, exp: ExperimentConfig):
-    """将实验参数写入模型实例属性（零开销）。"""
+    """记录实验参数（RTC 参数通过每次请求显式传入，不再写模型实例属性）。"""
     model = policy._model
-    model.rtc_guidance = exp.rtc_flag
-    model.replan_steps = exp.replan_steps
-    model.guidance_inference_delay = exp.delay_steps
-    model.guidance_prefix_attention_horizon = model.action_horizon - exp.replan_steps
-    model.guidance_prefix_attention_schedule = exp.schedule
-    model.guidance_max_weight = exp.max_weight
-    # 每组实验开始时重置 prev_action_chunk
-    model.prev_action_chunk = None
     logger.info(
         "RTC 参数已设置: rtc=%s, replan=%d, delay=%d, horizon=%d, schedule=%s, max_weight=%.1f",
         exp.rtc_flag, exp.replan_steps, exp.delay_steps,

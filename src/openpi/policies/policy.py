@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+import inspect
 import logging
 import pathlib
 import time
@@ -61,61 +62,47 @@ class Policy(BasePolicy):
             self._sample_actions = model.sample_actions
         else:
             # JAX model setup
-            # NOTE:
-            # We intentionally do NOT use nnx_utils.module_jit here.
-            # module_jit freezes module state at wrap time, which would make
-            # runtime-updated inference attributes (e.g. rtc_guidance,
-            # replan_steps, guidance_* set per request) stale during sampling.
-            # Calling the bound method directly keeps per-request config effective.
-            # self._sample_actions = nnx_utils.module_jit(model.sample_actions) # 因为sample_actions里可能会用到rtc_guidance等推理时才会设置的类成员，所以不能jit封装函数，假如改成形参传入，那么就可以使用封装后的函数了
-            self._sample_actions = model.sample_actions
+            self._sample_actions = nnx_utils.module_jit(
+                model.sample_actions,
+                static_argnames=(
+                    "rtc_guidance",
+                    "replan_steps",
+                    "guidance_inference_delay",
+                    "guidance_prefix_attention_horizon",
+                    "guidance_prefix_attention_schedule",
+                    "guidance_max_weight",
+                ),
+            )
             self._rng = rng or jax.random.key(0)
+
+        try:
+            self._sample_action_param_names = set(inspect.signature(model.sample_actions).parameters.keys())
+        except (TypeError, ValueError):
+            self._sample_action_param_names = set()
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
         rtc = obs.get("rtc")
-        if hasattr(self._model, "rtc_guidance") and rtc is not None:
-            self._model.rtc_guidance = bool(rtc)
-
         replan_steps = obs.get("replan_steps")
-        if hasattr(self._model, "replan_steps") and replan_steps is not None:
-            replan_steps = int(replan_steps)
-            self._model.replan_steps = replan_steps
-            if hasattr(self._model, "guidance_prefix_attention_horizon") and hasattr(self._model, "action_horizon"):
-                self._model.guidance_prefix_attention_horizon = self._model.action_horizon - replan_steps
-
         delay_steps = obs.get("delay_steps")
-        if hasattr(self._model, "guidance_inference_delay") and delay_steps is not None:
-            self._model.guidance_inference_delay = int(delay_steps)
-
         guidance_schedule = obs.get("guidance_prefix_attention_schedule")
-        if hasattr(self._model, "guidance_prefix_attention_schedule") and guidance_schedule is not None:
-            self._model.guidance_prefix_attention_schedule = str(guidance_schedule)
-
         guidance_max_weight = obs.get("guidance_max_weight")
-        if hasattr(self._model, "guidance_max_weight") and guidance_max_weight is not None:
-            self._model.guidance_max_weight = float(guidance_max_weight)
-
-        if hasattr(self._model, "rtc_guidance_chunk"):
-            rtc_guidance_chunk = obs.get("rtc_guidance_chunk")
-            if rtc_guidance_chunk is None:
-                self._model.rtc_guidance_chunk = None
-            else:
-                rtc_guidance_chunk = np.asarray(rtc_guidance_chunk)
-                if rtc_guidance_chunk.ndim == 2:
-                    rtc_guidance_chunk = rtc_guidance_chunk[None, ...]
-                model_action_dim = getattr(self._model, "action_dim", None)
-                if model_action_dim is not None and rtc_guidance_chunk.shape[-1] != model_action_dim:
-                    if rtc_guidance_chunk.shape[-1] < model_action_dim:
-                        pad_width = model_action_dim - rtc_guidance_chunk.shape[-1]
-                        rtc_guidance_chunk = np.pad(
-                            rtc_guidance_chunk,
-                            ((0, 0), (0, 0), (0, pad_width)),
-                            mode="constant",
-                        )
-                    else:
-                        rtc_guidance_chunk = rtc_guidance_chunk[..., :model_action_dim]
-                self._model.rtc_guidance_chunk = jnp.asarray(rtc_guidance_chunk)
+        rtc_guidance_chunk = obs.get("rtc_guidance_chunk")
+        if rtc_guidance_chunk is not None:
+            rtc_guidance_chunk = np.asarray(rtc_guidance_chunk)
+            if rtc_guidance_chunk.ndim == 2:
+                rtc_guidance_chunk = rtc_guidance_chunk[None, ...]
+            model_action_dim = getattr(self._model, "action_dim", None)
+            if model_action_dim is not None and rtc_guidance_chunk.shape[-1] != model_action_dim:
+                if rtc_guidance_chunk.shape[-1] < model_action_dim:
+                    pad_width = model_action_dim - rtc_guidance_chunk.shape[-1]
+                    rtc_guidance_chunk = np.pad(
+                        rtc_guidance_chunk,
+                        ((0, 0), (0, 0), (0, pad_width)),
+                        mode="constant",
+                    )
+                else:
+                    rtc_guidance_chunk = rtc_guidance_chunk[..., :model_action_dim]
 
         obs = {
             k: v
@@ -145,6 +132,32 @@ class Policy(BasePolicy):
 
         # Prepare kwargs for sample_actions
         sample_kwargs = dict(self._sample_kwargs)
+
+        if rtc is not None and "rtc_guidance" in self._sample_action_param_names:
+            sample_kwargs["rtc_guidance"] = bool(rtc)
+
+        if replan_steps is not None and "replan_steps" in self._sample_action_param_names:
+            sample_kwargs["replan_steps"] = int(replan_steps)
+
+        if delay_steps is not None and "guidance_inference_delay" in self._sample_action_param_names:
+            sample_kwargs["guidance_inference_delay"] = int(delay_steps)
+
+        if guidance_schedule is not None and "guidance_prefix_attention_schedule" in self._sample_action_param_names:
+            sample_kwargs["guidance_prefix_attention_schedule"] = str(guidance_schedule)
+
+        if guidance_max_weight is not None and "guidance_max_weight" in self._sample_action_param_names:
+            sample_kwargs["guidance_max_weight"] = float(guidance_max_weight)
+
+        if (
+            replan_steps is not None
+            and hasattr(self._model, "action_horizon")
+            and "guidance_prefix_attention_horizon" in self._sample_action_param_names
+        ):
+            sample_kwargs["guidance_prefix_attention_horizon"] = self._model.action_horizon - int(replan_steps)
+
+        if rtc_guidance_chunk is not None and "rtc_guidance_chunk" in self._sample_action_param_names:
+            sample_kwargs["rtc_guidance_chunk"] = jnp.asarray(rtc_guidance_chunk)
+
         if noise is not None:
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
 

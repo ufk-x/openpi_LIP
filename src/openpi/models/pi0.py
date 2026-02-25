@@ -253,17 +253,6 @@ class Pi0(_model.BaseModel):
         # 训练/评估模式标志，由 model.train() 和 model.eval() 自动设置
         self.deterministic = True
 
-        # ---- Realtime guidance 状态（外部设置，sample_actions 内部读取） ----
-        # 设置 rtc_guidance_chunk 为非 None 即可启用 realtime guidance，
-        # 无需修改 sample_actions 的调用方式。
-        self.rtc_guidance_chunk: at.Float[at.Array, "b ah ad"] | None = None
-        self.rtc_guidance: bool = False
-        self.replan_steps: int = 5
-        self.guidance_inference_delay: int = 5  
-        self.guidance_prefix_attention_horizon: int = config.action_horizon - self.replan_steps # 要求prefix_attention_horizon >= delay_steps
-        self.guidance_prefix_attention_schedule: PrefixAttentionSchedule = "exp"
-        self.guidance_max_weight: float = 5.0
-
     @at.typecheck
     def embed_prefix(
         self, obs: _model.Observation
@@ -573,19 +562,21 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        rtc_guidance: bool | None = None,
+        rtc_guidance_chunk: at.Float[at.Array, "b ah ad"] | None = None,
+        replan_steps: int | None = None,
+        guidance_inference_delay: int | None = None,
+        guidance_prefix_attention_horizon: int | None = None,
+        guidance_prefix_attention_schedule: PrefixAttentionSchedule | None = None,
+        guidance_max_weight: float | None = None,
     ) -> _model.Actions:
         """通过流匹配采样生成动作序列，可选 realtime guidance。
 
-        Realtime guidance 通过实例属性控制，无需修改此 API 的调用方式：
-        - 设置 self.rtc_guidance_chunk 为引导目标 action chunk 即可启用引导；
-        - 设置为 None 则退化为原始的纯 ODE 采样。
-
-        相关实例属性（在 __init__ 中初始化，可外部修改）：
-        - rtc_guidance_chunk: 当前推理的引导目标 action chunk [batch, ah, ad]，None 时禁用引导
-        - guidance_inference_delay: 已执行的动作步数（权重=1 的区间）
-        - guidance_prefix_attention_horizon: 引导关注范围上界
-        - guidance_prefix_attention_schedule: 权重衰减策略
-        - guidance_max_weight: 引导权重上限
+        Realtime guidance 通过本函数显式参数控制：
+        - rtc_guidance: 是否启用引导
+        - rtc_guidance_chunk: 引导目标 action chunk [batch, ah, ad]
+        - guidance_inference_delay / guidance_prefix_attention_horizon /
+          guidance_prefix_attention_schedule / guidance_max_weight: 引导配置
 
         核心数学（已适配 PI0 的时间约定 t: 1→0）：
         1. denoiser: hat_x_0 = x_t - t * v_t   （从含噪动作预测干净动作）
@@ -614,13 +605,23 @@ class Pi0(_model.BaseModel):
         if noise is None:
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
-        # 从实例属性读取 realtime guidance 配置
-        rtc_guidance_chunk = self.rtc_guidance_chunk
-        use_guidance = self.rtc_guidance and (rtc_guidance_chunk is not None)
-        inference_delay = self.guidance_inference_delay
-        prefix_attention_horizon = self.guidance_prefix_attention_horizon
-        prefix_attention_schedule = self.guidance_prefix_attention_schedule
-        max_guidance_weight = self.guidance_max_weight
+        runtime_guidance_chunk = rtc_guidance_chunk
+        runtime_rtc_guidance = bool(rtc_guidance) if rtc_guidance is not None else False
+        runtime_replan_steps = 5 if replan_steps is None else int(replan_steps)
+        inference_delay = 5 if guidance_inference_delay is None else int(guidance_inference_delay)
+        if guidance_prefix_attention_horizon is not None:
+            prefix_attention_horizon = int(guidance_prefix_attention_horizon)
+        elif replan_steps is not None:
+            prefix_attention_horizon = self.action_horizon - int(replan_steps)
+        else:
+            prefix_attention_horizon = self.action_horizon - runtime_replan_steps
+        prefix_attention_schedule = (
+            "exp" if guidance_prefix_attention_schedule is None else guidance_prefix_attention_schedule
+        )
+        max_guidance_weight = (
+            5.0 if guidance_max_weight is None else guidance_max_weight
+        )
+        use_guidance = runtime_rtc_guidance and (runtime_guidance_chunk is not None)
 
         # ---- 构建前缀 KV 缓存（只算一次） ----
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
@@ -689,7 +690,7 @@ class Pi0(_model.BaseModel):
                     return v_t + guidance_weight * pinv_correction
 
                 v_t = pinv_corrected_velocity(
-                    observation.state, x_t, rtc_guidance_chunk, time
+                    observation.state, x_t, runtime_guidance_chunk, time
                 )
             else:
                 # ---- 原始模式：纯速度场，无引导 ----
