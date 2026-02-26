@@ -25,7 +25,9 @@ PI0 vs PI0.5：
 """
 
 import functools
+import json
 import logging
+import pathlib
 from typing import Literal, TypeAlias
 
 import einops
@@ -33,6 +35,7 @@ import flax.nnx as nnx
 import flax.nnx.bridge as nnx_bridge
 import jax
 import jax.numpy as jnp
+import numpy as np
 from typing_extensions import override
 
 from openpi.models import model as _model
@@ -42,6 +45,31 @@ import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
+
+
+def _append_rtc_guidance_log_yaml(
+    denoise_timestamp,
+    guidance_max_weight,
+    c_times_inv_r2,
+    guidance_weight,
+    # pinv_correction,
+) -> None:
+    """Append one RTC-guidance denoising-step record to YAML log file."""
+    log_path = pathlib.Path("data/libero/rtc_guidance_log.yaml")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    t_val = float(np.asarray(denoise_timestamp))
+    w_val = float(np.asarray(guidance_max_weight))
+    c_vals = np.asarray(c_times_inv_r2).tolist()
+    g_vals = np.asarray(guidance_weight).tolist()
+    # pinv_vals = np.asarray(pinv_correction).tolist()
+
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(f"- denoise_timestamp: {t_val}\n")
+        f.write(f"  guidance_max_weight: {w_val}\n")
+        f.write(f"  c_times_inv_r2: {json.dumps(c_vals, ensure_ascii=False)}\n")
+        f.write(f"  guidance_weight: {json.dumps(g_vals, ensure_ascii=False)}\n")
+        # f.write(f"  pinv_correction: {json.dumps(pinv_vals, ensure_ascii=False)}\n")
 
 
 def make_attn_mask(input_mask, mask_ar):
@@ -630,7 +658,6 @@ class Pi0(_model.BaseModel):
         _, kv_cache = self.PaliGemma.llm(
             [prefix_tokens, None], mask=prefix_attn_mask, positions=pos
         )
-
         def step(carry):
             """ODE 积分的单步更新，可选 realtime guidance 校正。"""
             x_t, time = carry
@@ -683,14 +710,32 @@ class Pi0(_model.BaseModel):
                     # PI0 中 t: 1→0, 映射关系 t_ref = 1-t, 因此:
                     #   c = t / (1-t)
                     #   inv_r2 = (t^2 + (1-t)^2) / t^2
+
+                    ## ORIGINAL：
                     inv_r2 = (t**2 + (1 - t) ** 2) / (t**2 + 1e-8)
                     c = jnp.nan_to_num(t / (1 - t), posinf=max_guidance_weight)
-                    guidance_weight = jnp.minimum(c * inv_r2, max_guidance_weight)
+                    c_times_inv_r2 = c * inv_r2
+                    guidance_weight = jnp.minimum(c_times_inv_r2, max_guidance_weight)
 
-                    return v_t + guidance_weight * pinv_correction
+                    ## ！！！TEST：
+                    # base = (2.0 * t * (1.0 - t)) / (t**2 + (1.0 - t)**2 + 1e-8)
+                    # exponent = jnp.sign(0.5 - t) # 指数项：x < 0.5 为 1, x > 0.5 为 -1
+                    # y = 2.0 * (base ** exponent) # 当 x=1 时，0.0 ** -1.0 会产生 inf
+                    # c_times_inv_r2 = jnp.nan_to_num(y, nan=0.0, posinf=max_guidance_weight)
+                    # guidance_weight = jnp.minimum(c_times_inv_r2, max_guidance_weight) * 2.3
 
-                v_t = pinv_corrected_velocity(
+                    return v_t + guidance_weight * pinv_correction, pinv_correction, c_times_inv_r2, guidance_weight
+
+                v_t, pinv_correction_batch, c_times_inv_r2_batch, guidance_weight_batch = pinv_corrected_velocity(
                     observation.state, x_t, runtime_guidance_chunk, time
+                )
+                jax.debug.callback(
+                    _append_rtc_guidance_log_yaml,
+                    time,
+                    jnp.asarray(max_guidance_weight),
+                    c_times_inv_r2_batch,
+                    guidance_weight_batch,
+                    # pinv_correction_batch,
                 )
             else:
                 # ---- 原始模式：纯速度场，无引导 ----

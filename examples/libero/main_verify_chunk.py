@@ -18,12 +18,6 @@ LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256
 CHUNK_SIZE = 10  # 用于 realtime guidance 的 action chunk 大小
 
-RTC_FLAG: bool = False  # 是否启用 realtime guidance
-DELAY_STEPS: int = 3  # 推理延迟步数
-REPLANE_STEPS: int = 5  # 每次 replanning 的执行步数（execute_horizon）
-GUIDANCE_PREFIX_ATTENTION_SCHEDULE = "exp"  # prefix attention 调度方式
-GUIDANCE_MAX_WEIGHT: float = 5.0  # RTC guidance 权重的默认值
-
 @dataclasses.dataclass
 class Args:
     # 模型服务
@@ -40,16 +34,19 @@ class Args:
 
     # 可视化
     action_dim_to_plot: int = 0
-    num_new_chunks: int = 5
+    num_new_chunks: int = 10
     max_chunk_points: int = -1  # <=0 表示不截断
     plot_out_path: str = ""
 
     # rtc 参数（会传递到模型实例属性）
-    rtc: bool = RTC_FLAG  # 是否启用 realtime guidance
-    replan_steps: int = REPLANE_STEPS  # 每次 replanning 的执行步数（execute_horizon）
-    delay_steps: int = DELAY_STEPS  # 推理延迟步数
-    guidance_prefix_attention_schedule: str = GUIDANCE_PREFIX_ATTENTION_SCHEDULE  # prefix attention 调度方式
-    guidance_max_weight: float = GUIDANCE_MAX_WEIGHT  # RTC guidance 权重的最大值
+    rtc: bool = False  # 是否启用 realtime guidance
+    replan_steps: int = 5  # 每次 replanning 的执行步数（execute_horizon）
+    delay_steps: int = 5  # 推理延迟步数
+    guidance_prefix_attention_schedule: str = "exp"  # prefix attention 调度方式
+    guidance_max_weight: float = 15  # RTC guidance 权重的最大值
+
+    # batch 运行参数
+    batch_id: int = 0
 
     # 复现
     seed: int = 42
@@ -178,7 +175,7 @@ def verify_chunk(args: Args) -> None:
     if not args.plot_out_path:
         args.plot_out_path = (
             f"data/libero/chunk_verify_{args.task_suite_name}_task{args.task_id}_"
-            f"ep{args.episode_idx}_infer{args.max_infer_n}_dim{args.action_dim_to_plot}_rtc{args.rtc}_replan{args.replan_steps}_delay{args.delay_steps}_schedule{args.guidance_prefix_attention_schedule}.png"
+            f"ep{args.episode_idx}_infer{args.max_infer_n}_dim{args.action_dim_to_plot}_rtc{args.rtc}_replan{args.replan_steps}_delay{args.delay_steps}_schedule{args.guidance_prefix_attention_schedule}_batch{args.batch_id:03d}.png" # batch_id 格式，batch01, batch02, ...
         )
     pathlib.Path(args.plot_out_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -320,7 +317,7 @@ def verify_chunk(args: Args) -> None:
 
         delay_line_x = freeze_timestamp + args.delay_steps - 1
 
-        def _mean_l2_distance_in_delay_window(chunks: List[np.ndarray]) -> float:
+        def _mean_l2_distance_in_delay_window(chunks: List[np.ndarray], action_dim: Optional[int] = None) -> float:
             if args.delay_steps <= 0:
                 return float("nan")
 
@@ -344,9 +341,12 @@ def verify_chunk(args: Args) -> None:
                     span = min(new_end - new_start + 1, len(chunk), span)
                 if span <= 0:
                     continue
-
-                pre_seg = pre_chunk[valid_start : valid_start + span, args.action_dim_to_plot]
-                new_seg = chunk[new_start : new_start + span, args.action_dim_to_plot]
+                if action_dim is None:
+                    pre_seg = pre_chunk[valid_start : valid_start + span]
+                    new_seg = chunk[new_start : new_start + span]
+                else:
+                    pre_seg = pre_chunk[valid_start : valid_start + span, action_dim]
+                    new_seg = chunk[new_start : new_start + span, action_dim]
                 diff = new_seg - pre_seg
                 dists.append(float(np.sqrt(np.sum(np.square(diff)))))
 
@@ -357,6 +357,16 @@ def verify_chunk(args: Args) -> None:
         mean_dist_no_rtc = _mean_l2_distance_in_delay_window(new_chunks_no_rtc)
         mean_dist_rtc = _mean_l2_distance_in_delay_window(new_chunks_rtc)
         improvement = (mean_dist_no_rtc - mean_dist_rtc) / mean_dist_no_rtc * 100 if not math.isnan(mean_dist_no_rtc) and not math.isnan(mean_dist_rtc) else float("nan")
+
+        per_dim_improvements = []
+        for dim_idx in range(pre_chunk.shape[1]):
+            dim_no_rtc = _mean_l2_distance_in_delay_window(new_chunks_no_rtc, action_dim=dim_idx)
+            dim_rtc = _mean_l2_distance_in_delay_window(new_chunks_rtc, action_dim=dim_idx)
+            if not math.isnan(dim_no_rtc) and not math.isnan(dim_rtc) and dim_no_rtc != 0:
+                dim_improvement = (dim_no_rtc - dim_rtc) / dim_no_rtc * 100
+            else:
+                dim_improvement = float("nan")
+            per_dim_improvements.append((dim_idx, dim_improvement))
 
 
         plt.figure(figsize=(10, 5))
@@ -395,19 +405,27 @@ def verify_chunk(args: Args) -> None:
             plt.axvline(x=delay_line_x, color="red", linestyle="--", label="delay boundary")
 
         if use_delay:
+            per_dim_lines = [
+                f"dim{dim_idx}: {dim_imp:.2f}%"
+                for dim_idx, dim_imp in per_dim_improvements
+            ]
             dist_text = (
-                f"mean L2(pre,new) [{freeze_timestamp},{delay_line_x}]\n"
-                f"no_rtc: {mean_dist_no_rtc:.6f}\n"
-                f"rtc: {mean_dist_rtc:.6f}"
-                f"\nimprovement: {improvement:.2f}%"
+                f"per-dim improvement [{freeze_timestamp},{delay_line_x}]\n"
+                + "\n".join(per_dim_lines)
+                + "\n"
+                + f"mean L2(pre,new) [{freeze_timestamp},{delay_line_x}]\n"
+                + f"no_rtc: {mean_dist_no_rtc:.6f}\n"
+                + f"rtc: {mean_dist_rtc:.6f}\n"
+                + f"improvement: {improvement:.2f}%"
             )
         else:
             dist_text = "mean L2(pre,new) [freeze, delay_line]: N/A (delay_steps<=0)"
         plt.gca().text(
-            0.02,
+            0.98,
             0.02,
             dist_text,
             transform=plt.gca().transAxes,
+            horizontalalignment="right",
             verticalalignment="bottom",
             fontsize=9,
             bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.75},
@@ -416,12 +434,14 @@ def verify_chunk(args: Args) -> None:
         plt.xlabel("env timestamp")
         plt.ylabel(f"action[{args.action_dim_to_plot}]")
         plt.title(
-            f"rtc_on+off|delay_steps={args.delay_steps}|replan_steps={args.replan_steps}|suite={args.task_suite_name}|task={args.task_id}|"
+            f"rtc_on+off|dim={args.action_dim_to_plot}|delay_steps={args.delay_steps}|replan_steps={args.replan_steps}|suite={args.task_suite_name}|task={args.task_id}|"
             f"ep={args.episode_idx}|freeze_t={freeze_timestamp}"
         )
         plt.grid(True, alpha=0.3)
         plt.legend()
-        plt.tight_layout()
+        # plt.tight_layout()
+        # y轴范围是正负0.5倍动作范围（假设动作范围是[-1, 1]，根据实际情况调整）
+        plt.ylim(-0.5, 0.5)
         plt.savefig(args.plot_out_path, dpi=180)
         plt.close()
 
